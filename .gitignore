@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Outputs (results are in repo, but exclude generated runs)
+outputs/*/seed_*/
+outputs/hyperparam_search/
+outputs/summaries/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (638MB, too large for git)
+data/
+
+# Paper PDFs (exclude from git if large)
+# paper/*.pdf
