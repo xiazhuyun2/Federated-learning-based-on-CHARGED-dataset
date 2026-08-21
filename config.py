@@ -59,6 +59,15 @@ class DataConfig:
     use_lag_features: bool = True
     use_rolling_features: bool = True
     use_static_features: bool = True
+    # 多城市预处理 (P2)
+    station_selection: str = "top_k"       # "top_k" | "stratified_natural" | "stratified_balanced" | "proportional"
+    min_city_clients: int = 2              # proportional 分配时每城保底客户端数
+    price_normalization: bool = True       # 电价城市内标准化
+    load_normalization: bool = True        # 添加 per-charger 和 load_rate 特征
+    timezone_offsets: dict = field(default_factory=lambda: {
+        "SZH": 8, "AMS": 2, "JHB": 2,
+        "LOA": -7, "MEL": 10, "SPO": -3,
+    })
 
 
 @dataclass
@@ -94,6 +103,10 @@ class FedConfig:
     min_cluster_size: int = 2             # 最小簇大小, 防止无效聚类
     # 本地微调 (P1)
     finetune_epochs: int = 0              # 全局训练后本地微调轮次, 0=禁用
+    # 多城市平衡聚合 (P2)
+    city_weight_alpha: float = 0.5         # 0=等权, 1=样本量加权, 0.5=折中
+    multi_city_mode: str = "single"        # "single" | "multi_city"
+    client_fraction: float = 1.0           # 每轮参与聚合的客户端比例 (0,1]; 1.0=全部参与
 
 
 @dataclass

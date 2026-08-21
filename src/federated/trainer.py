@@ -12,18 +12,22 @@ import copy
 import os
 import json
 import torch
+import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
 from collections import OrderedDict
 from typing import List, Dict, Optional
 
+from config import DATA_DIR, OUTPUT_DIR
 from src.data.data_loader import (
-    load_city_data, select_top_stations,
+    load_city_data, select_top_stations, stratified_sample_stations,
     build_station_dataframe, get_station_static_features
 )
 from src.data.feature_engineering import prepare_station_data
 from src.models.tcn_lstm import build_model
-from src.federated.aggregation import FLClient, FLServer, ClusteredFLServer
+from src.federated.aggregation import (
+    FLClient, FLServer, ClusteredFLServer, CityBalancedServer
+)
 from src.utils.metrics import evaluate_model, set_seed
 from src.utils.experiment_tracker import ExperimentTracker
 from src.utils.visualization import (
@@ -31,23 +35,72 @@ from src.utils.visualization import (
 )
 
 
-def _get_excluded_param_names(model) -> List[str]:
-    """获取不参与联邦聚合的参数名列表 (FedBN + 本地预测头)"""
-    excluded = []
-    for name, _ in model.named_parameters():
-        # FedBN: 跳过所有 BatchNorm 参数
-        if "bn" in name:
-            excluded.append(name)
-        # 本地预测头: 跳过最后的线性层
-        if "fc.3" in name:  # nn.Sequential 中第4个子模块 (Linear)
-            excluded.append(name)
-    return excluded
+def _get_excluded_param_names(model, use_fedbn: bool = False,
+                             use_local_head: bool = False) -> List[str]:
+    """获取不参与联邦聚合的参数名列表 (FedBN + 本地预测头)。
+
+    遍历 state_dict 的全部 key (含 BN 的 running_mean/var 等 buffer),
+    按开关分别排除:
+      - 所有 BatchNorm 层的 weight/bias/running_* (FedBN)
+      - 输出头 fc 序列中最后一个 nn.Linear 的 weight/bias (LocalHead)
+
+    注意: 两个开关必须独立。若忽略开关而永远同时排除 BN+头,
+    会让 FedBN / LocalHead / 两者 三种消融产出完全相同的结果。
+    """
+    excluded = set()
+
+    # 1) FedBN: 所有 BatchNorm 层 (含 running stats buffer, 避免被聚合/广播覆盖)
+    if use_fedbn:
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                prefix = f"{name}." if name else ""
+                for sub in ("weight", "bias", "running_mean", "running_var",
+                            "num_batches_tracked"):
+                    excluded.add(f"{prefix}{sub}")
+
+    # 2) LocalHead: fc 序列中最后一个 Linear 层 (预测头)
+    if use_local_head:
+        head = getattr(model, "fc", None)
+        last_linear = None
+        if isinstance(head, nn.Sequential):
+            for sub in reversed(list(head.children())):
+                if isinstance(sub, nn.Linear):
+                    last_linear = sub
+                    break
+        elif isinstance(head, nn.Linear):
+            last_linear = head
+
+        if last_linear is not None:
+            for name, module in model.named_modules():
+                if module is last_linear:
+                    prefix = f"{name}." if name else ""
+                    excluded.add(f"{prefix}weight")
+                    excluded.add(f"{prefix}bias")
+                    break
+
+    return sorted(excluded)
+
+
+def _hash_params(state_dict, exclude=None) -> str:
+    """对 state_dict 中非排除参数计算 SHA256 哈希 (用于跨 α 比较第一轮模型)。"""
+    import hashlib
+    h = hashlib.sha256()
+    exclude = set(exclude or [])
+    for key in sorted(state_dict.keys()):
+        if key in exclude:
+            continue
+        h.update(key.encode("utf-8"))
+        arr = state_dict[key].float().cpu().detach().numpy()
+        h.update(np.ascontiguousarray(arr).tobytes())
+    return h.hexdigest()
 
 
 class FederatedTrainer:
     """
     联邦学习训练器
     负责: 数据准备 -> 客户端创建 -> 联邦训练循环 -> 评估与日志
+
+    支持单城市模式 (prepare_city_clients) 和多城市模式 (prepare_multi_city_clients).
     """
 
     def __init__(self, config, run_dir: str = None, city: str = None,
@@ -60,6 +113,11 @@ class FederatedTrainer:
         self.scalers = {}  # client_id -> scaler
         self.test_loaders = {}  # client_id -> test_loader
         self.val_loaders = {}  # client_id -> val_loader
+
+        # 多城市支持
+        self.cities: List[str] = []
+        self.city_client_map: Dict[str, List[int]] = {}  # city -> [client_indices]
+        self.city_data_sizes: Dict[str, float] = {}       # city -> total N_c
 
         # 实验追踪
         self.city = city or "unknown"
@@ -85,67 +143,254 @@ class FederatedTrainer:
         self.best_round = 0
         self.best_model_state = None
 
+        # 聚合验收 (问题与解决3.txt 第三节三层证据)
+        self._city_weights = None
+        self.first_round_hash = None
+
+    def _add_station_client(self, city: str, sid: str, city_data: Dict):
+        """
+        为单个站点构建客户端并注册 (被 prepare_city_clients 和
+        prepare_multi_city_clients 共用).
+        """
+        df = build_station_dataframe(
+            city_data, sid, self.cfg.data.time_col,
+            timezone_offset=self.cfg.data.timezone_offsets.get(city, 0),
+            price_normalization=self.cfg.data.price_normalization,
+            add_load_norm=self.cfg.data.load_normalization,
+        )
+        print(f"  Station {sid}: {len(df)} samples, "
+              f"{len(df.columns)-2} features, "
+              f"mean load={df['target'].mean():.2f}")
+
+        train_ds, val_ds, test_ds, scaler = prepare_station_data(
+            df,
+            seq_len=self.cfg.data.seq_len,
+            pred_len=self.cfg.data.pred_len,
+            train_ratio=self.cfg.data.train_ratio,
+            val_ratio=self.cfg.data.val_ratio,
+        )
+
+        if len(train_ds) == 0:
+            print(f"    WARNING: Station {sid} has no training samples, skipping")
+            return
+
+        train_loader = DataLoader(
+            train_ds, batch_size=self.cfg.fed.batch_size,
+            shuffle=True, drop_last=False
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=self.cfg.fed.batch_size, shuffle=False
+        )
+        test_loader = DataLoader(
+            test_ds, batch_size=self.cfg.fed.batch_size, shuffle=False
+        )
+
+        input_dim = train_ds[0][0].shape[1]
+        model = build_model(input_dim, self.cfg.data.pred_len, self.cfg.model)
+
+        client_id = f"{city}_{sid}"
+        client = FLClient(client_id, model, train_loader, val_loader, self.device)
+        self.clients.append(client)
+        self.scalers[client_id] = scaler
+        self.test_loaders[client_id] = test_loader
+        self.val_loaders[client_id] = val_loader
+
+        return client
+
+    # ── 选站策略 (场景A分层 / 场景B比例分配) ──────────────────
+
+    def _allocate_city_budget(self, cities: List[str], total_budget: int,
+                              size_metric: str = "count"):
+        """
+        按各城有效站点规模分配客户端预算 (场景B: 自然不均衡)。
+
+        分配逻辑 (对应 问题与解决3.txt 第二节):
+          1. 每城保底 min_city_clients 个;
+          2. 剩余预算按「超出保底部分的有效站点数」比例分配;
+          3. 最大余数法保证 sum(alloc) == total_budget。
+
+        Returns: (alloc: {city: n_clients}, sizes: {city: n_valid_stations})
+        """
+        sizes = {}
+        for city in cities:
+            cd = load_city_data(DATA_DIR, city, self.cfg.data.use_remove_zero)
+            all_valid = select_top_stations(
+                cd["volume"], self.cfg.data.time_col, k=10 ** 6,
+                train_ratio=self.cfg.data.train_ratio + self.cfg.data.val_ratio)
+            sizes[city] = float(len(all_valid))
+
+        total_size = sum(sizes.values())
+        min_city = max(1, int(getattr(self.cfg.data, "min_city_clients", 2)))
+
+        # 剩余预算按 (N_c - min_city) 超出保底的部分分配
+        excess = {c: max(0.0, sizes[c] - min_city) for c in cities}
+        excess_total = sum(excess.values())
+
+        raw = {}
+        for c in cities:
+            raw[c] = (total_budget - min_city * len(cities)) * (
+                excess[c] / excess_total) if excess_total > 0 else 0.0
+
+        # 最大余数法: 取整 + 按小数部分补足
+        alloc = {c: min_city + int(raw[c]) for c in cities}
+        frac = {c: raw[c] - int(raw[c]) for c in cities}
+        # 小数部分降序, 并列时按城市名保证确定性
+        order = sorted(cities, key=lambda c: (-frac[c], c))
+        i = 0
+        while sum(alloc.values()) < total_budget:
+            alloc[order[i % len(order)]] += 1
+            i += 1
+
+        print(f"  City budget allocation (total={total_budget}, min/city={min_city}):")
+        for c in cities:
+            print(f"    {c}: {alloc[c]} clients (valid_stations={int(sizes[c])})")
+        return alloc, sizes
+
+    def _select_stations_for_city(self, city: str, city_data: Dict, k: int):
+        """按配置的选站策略为单个城市选择 k 个站点。"""
+        sel = self.cfg.data.station_selection
+        train_ratio = self.cfg.data.train_ratio + self.cfg.data.val_ratio
+        if sel.startswith("stratified"):
+            dist = "natural" if "natural" in sel else "balanced"
+            stations, _ = stratified_sample_stations(
+                city_data["volume"], city_data, self.cfg.data.time_col, k,
+                train_ratio=train_ratio, distribution=dist, seed=self.cfg.seed)
+        else:
+            stations = select_top_stations(
+                city_data["volume"], self.cfg.data.time_col, k,
+                train_ratio=train_ratio)
+        return stations
+
+    def _station_list_path(self) -> str:
+        d = self.cfg.data
+        sig = (f"{d.station_selection}_k{d.top_k_stations}_"
+               f"tr{d.train_ratio}_vr{d.val_ratio}_rz{int(d.use_remove_zero)}"
+               f"_s{self.cfg.seed}")
+        return os.path.join(OUTPUT_DIR, "station_lists", f"{sig}.json")
+
+    def _load_or_create_station_list(self, cities: List[str]) -> Dict[str, List[str]]:
+        """
+        返回 {city: [station_ids]}, 并持久化到 outputs/station_lists/。
+
+        保证同一选站策略+seed 下, α/FedBN/LocalHead 等所有实验使用完全相同的站点
+        (问题与解决3.txt 第二节第 127 行要求)。
+        """
+        path = self._station_list_path()
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                station_list = json.load(f)
+            print(f"  Loaded station list from {path}")
+            return station_list
+
+        budget = None
+        if self.cfg.data.station_selection == "proportional":
+            budget, _ = self._allocate_city_budget(
+                cities, self.cfg.data.top_k_stations, size_metric="count")
+
+        station_list = {}
+        for city in cities:
+            cd = load_city_data(DATA_DIR, city, self.cfg.data.use_remove_zero)
+            k = budget[city] if budget else self.cfg.data.top_k_stations
+            station_list[city] = self._select_stations_for_city(city, cd, k)
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(station_list, f, indent=2)
+        print(f"  Saved station list to {path}")
+        return station_list
+
     def prepare_city_clients(self, city: str):
-        """为单个城市准备所有客户端"""
+        """为单个城市准备所有客户端 (向后兼容)"""
         self.city = city
+        self.cities = [city]
         print(f"\n{'='*60}")
         print(f"  Loading data for city: {city}")
         print(f"{'='*60}")
 
-        data_dir = os.path.join(os.path.dirname(self.cfg.output_dir), "data")
+        data_dir = DATA_DIR
         city_data = load_city_data(data_dir, city, self.cfg.data.use_remove_zero)
 
-        # 选择 top-k 站点 (统计量仅基于训练期, 避免测试集泄漏)
-        stations = select_top_stations(
-            city_data["volume"], self.cfg.data.time_col,
-            self.cfg.data.top_k_stations,
-            train_ratio=self.cfg.data.train_ratio + self.cfg.data.val_ratio
-        )
+        # 选择站点
+        if self.cfg.data.station_selection.startswith("stratified"):
+            dist = "natural" if "natural" in self.cfg.data.station_selection else "balanced"
+            stations, _ = stratified_sample_stations(
+                city_data["volume"], city_data, self.cfg.data.time_col,
+                self.cfg.data.top_k_stations,
+                train_ratio=self.cfg.data.train_ratio + self.cfg.data.val_ratio,
+                distribution=dist,
+                seed=self.cfg.seed,
+            )
+        else:
+            stations = select_top_stations(
+                city_data["volume"], self.cfg.data.time_col,
+                self.cfg.data.top_k_stations,
+                train_ratio=self.cfg.data.train_ratio + self.cfg.data.val_ratio
+            )
         print(f"  Selected {len(stations)} stations: {stations[:5]}...")
 
         for sid in stations:
-            # 构建站点 DataFrame
-            df = build_station_dataframe(city_data, sid, self.cfg.data.time_col)
-            print(f"  Station {sid}: {len(df)} samples, "
-                  f"{len(df.columns)-2} features, "
-                  f"mean load={df['target'].mean():.2f}")
+            self._add_station_client(city, sid, city_data)
 
-            # 构建数据集
-            train_ds, val_ds, test_ds, scaler = prepare_station_data(
-                df,
-                seq_len=self.cfg.data.seq_len,
-                pred_len=self.cfg.data.pred_len,
-                train_ratio=self.cfg.data.train_ratio,
-                val_ratio=self.cfg.data.val_ratio,
+        # 更新城市-客户端映射
+        self.city_client_map[city] = list(range(len(self.clients)))
+        if self.clients:
+            self.city_data_sizes[city] = sum(
+                c.data_size for c in self.clients
             )
-
-            if len(train_ds) == 0:
-                print(f"    WARNING: Station {sid} has no training samples, skipping")
-                continue
-
-            train_loader = DataLoader(
-                train_ds, batch_size=self.cfg.fed.batch_size,
-                shuffle=True, drop_last=False
-            )
-            val_loader = DataLoader(
-                val_ds, batch_size=self.cfg.fed.batch_size, shuffle=False
-            )
-            test_loader = DataLoader(
-                test_ds, batch_size=self.cfg.fed.batch_size, shuffle=False
-            )
-
-            # 构建本地模型
-            input_dim = train_ds[0][0].shape[1]  # (seq_len, features)
-            model = build_model(input_dim, self.cfg.data.pred_len, self.cfg.model)
-
-            client_id = f"{city}_{sid}"
-            client = FLClient(client_id, model, train_loader, val_loader, self.device)
-            self.clients.append(client)
-            self.scalers[client_id] = scaler
-            self.test_loaders[client_id] = test_loader
-            self.val_loaders[client_id] = val_loader
 
         print(f"\n  Total clients for {city}: {len(self.clients)}")
+
+    def prepare_multi_city_clients(self, cities: List[str]):
+        """为多个城市准备所有客户端 (多城市联邦学习)"""
+        self.cities = cities
+        print(f"\n{'='*60}")
+        print(f"  Loading data for {len(cities)} cities: {cities}")
+        print(f"{'='*60}")
+
+        data_dir = DATA_DIR
+
+        # 统一选站 (场景A分层 / 场景B比例分配), 并持久化保证跨实验一致
+        station_list = self._load_or_create_station_list(cities)
+
+        for city in cities:
+            print(f"\n  --- City: {city} ---")
+            try:
+                city_data = load_city_data(data_dir, city, self.cfg.data.use_remove_zero)
+                stations = station_list.get(city, [])
+                print(f"  Selected {len(stations)} stations: {stations[:5]}...")
+
+                # 记录该城市客户端在当前 client 列表中的起始位置
+                city_start_idx = len(self.clients)
+                city_clients_added = 0
+
+                for sid in stations:
+                    result = self._add_station_client(city, sid, city_data)
+                    if result is not None:
+                        city_clients_added += 1
+
+                # 更新城市-客户端映射
+                city_end_idx = len(self.clients)
+                self.city_client_map[city] = list(
+                    range(city_start_idx, city_end_idx)
+                )
+                self.city_data_sizes[city] = sum(
+                    self.clients[i].data_size
+                    for i in range(city_start_idx, city_end_idx)
+                )
+                print(f"  City {city}: {city_clients_added} clients "
+                      f"(N_c={self.city_data_sizes[city]:.0f})")
+
+            except Exception as e:
+                print(f"  ERROR loading city {city}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        self.city = "+".join(cities)  # 用于目录名
+        print(f"\n  Total clients across {len(cities)} cities: {len(self.clients)}")
+        for c in cities:
+            n_clients = len(self.city_client_map.get(c, []))
+            n_data = self.city_data_sizes.get(c, 0)
+            print(f"    {c}: {n_clients} stations, N_c={n_data:.0f}")
 
     def run_federated_training(self) -> Dict:
         """
@@ -159,7 +404,8 @@ class FederatedTrainer:
 
         # 确定聚合时排除的参数
         if self._use_fedbn or self._use_local_head:
-            self.excluded_param_names = _get_excluded_param_names(global_model)
+            self.excluded_param_names = _get_excluded_param_names(
+                global_model, self._use_fedbn, self._use_local_head)
             if self._use_fedbn:
                 bn_count = sum(1 for n in self.excluded_param_names if "bn" in n)
                 print(f"  FedBN enabled: {bn_count} BN params excluded from aggregation")
@@ -168,16 +414,39 @@ class FederatedTrainer:
                 print(f"  Local head enabled: {head_count} head params excluded")
 
         # 选择聚合策略
+        is_multi_city = len(self.cities) > 1
+        server_cls = None
+        use_city_balance = (
+            is_multi_city
+            and self.cfg.fed.multi_city_mode == "multi_city"
+        )
+
         if self.cfg.fed.aggregation == "clustered":
             server = ClusteredFLServer(
                 global_model, self.cfg.fed.n_clusters,
                 mu=self.cfg.fed.fedprox_mu,
                 min_cluster_size=self.cfg.fed.min_cluster_size
             )
+        elif use_city_balance and self.cfg.fed.multi_city_mode == "multi_city":
+            from src.federated.aggregation import CityBalancedServer
+            server = CityBalancedServer(
+                global_model,
+                alpha=self.cfg.fed.city_weight_alpha,
+                aggregation=self.cfg.fed.aggregation,
+            )
+            server.set_city_groups(self.cities, self.city_data_sizes)
+            self._city_weights = dict(getattr(server, "city_weights", {}))
+            print(f"  City-Balanced Server: α={self.cfg.fed.city_weight_alpha}")
         else:
             server = FLServer(global_model, self.cfg.fed.aggregation)
 
-        mu = self.cfg.fed.fedprox_mu if self.cfg.fed.aggregation in ("fedprox", "clustered") else 0.0
+        # FedProx mu
+        if self.cfg.fed.aggregation in ("fedprox",):
+            mu = self.cfg.fed.fedprox_mu
+        elif self.cfg.fed.aggregation == "clustered":
+            mu = self.cfg.fed.fedprox_mu
+        else:
+            mu = 0.0
 
         history = {"rounds": [], "avg_loss": [], "val_metrics": []}
 
@@ -214,7 +483,11 @@ class FederatedTrainer:
                     params_to_send = copy.deepcopy(global_params)
                     proximal_ref = global_params
 
-                client.set_parameters(params_to_send)
+                # FedBN/LocalHead: 第 0 轮全量广播 (统一初始化), 之后跳过 BN/头,
+                # 保留各客户端本地训练得到的 BN 统计量 / 本地预测头。
+                exclude = (self.excluded_param_names
+                           if (round_idx > 0 and self.excluded_param_names) else None)
+                client.set_parameters(params_to_send, exclude_names=exclude)
 
                 stats = client.train_local(
                     epochs=self.cfg.fed.local_epochs,
@@ -229,8 +502,30 @@ class FederatedTrainer:
                 round_loss += stats["loss"]
 
             # 3. 聚合 (支持排除 BN/Head 参数)
-            server.aggregate(client_params_list, client_weights,
-                             exclude_param_names=self.excluded_param_names if self.excluded_param_names else None)
+            # 3. 聚合 (支持城市平衡)
+            if use_city_balance and isinstance(server, CityBalancedServer):
+                # 构建 client_city_map: client_index -> city_name
+                client_city_list = [""] * len(self.clients)
+                for city_name, indices in self.city_client_map.items():
+                    for idx in indices:
+                        if idx < len(client_city_list):
+                            client_city_list[idx] = city_name
+                server.aggregate(
+                    client_params_list, client_weights,
+                    exclude_param_names=self.excluded_param_names if self.excluded_param_names else None,
+                    client_city_map=client_city_list,
+                )
+            else:
+                server.aggregate(
+                    client_params_list, client_weights,
+                    exclude_param_names=self.excluded_param_names if self.excluded_param_names else None)
+
+            # 记录第一轮聚合后的共享参数哈希 (用于跨 α 比较, 验收第三层)
+            if round_idx == 0:
+                self.first_round_hash = _hash_params(
+                    server.global_model.state_dict(),
+                    exclude=(self.excluded_param_names
+                             if self.excluded_param_names else None))
 
             avg_loss = round_loss / len(self.clients)
             history["rounds"].append(round_idx + 1)
@@ -268,7 +563,10 @@ class FederatedTrainer:
                     params = server.get_cluster_params(idx)
                 else:
                     params = server.get_global_params()
-                client.set_parameters(params)
+                client.set_parameters(
+                    params,
+                    exclude_names=(self.excluded_param_names
+                                   if self.excluded_param_names else None))
                 stats = client.train_local(
                     epochs=self.cfg.fed.finetune_epochs,
                     lr=self.cfg.fed.lr * 0.1,
@@ -298,42 +596,104 @@ class FederatedTrainer:
         return test_results
 
     def _evaluate_all_clients(self, server) -> Dict[str, float]:
-        """在所有客户端的验证集上评估"""
-        all_rmse, all_mae, all_wape = [], [], []
+        """在所有客户端的验证集上评估, 多城市模式返回多层级指标"""
+        is_multi_city = len(self.cities) > 1
+        per_client_metrics = {}
 
         for i, client in enumerate(self.clients):
             if isinstance(server, ClusteredFLServer):
                 params = server.get_cluster_params(i)
+            elif isinstance(server, CityBalancedServer):
+                # 获取该客户端所属城市的模型
+                client_city = client.client_id.split("_")[0]
+                city_params = server.get_city_params(client_city)
+                params = city_params if city_params else server.get_global_params()
             else:
                 params = server.get_global_params()
 
-            client.set_parameters(params)
+            client.set_parameters(
+                params,
+                exclude_names=(self.excluded_param_names
+                               if self.excluded_param_names else None))
             metrics = evaluate_model(
                 client.model, client.val_loader,
                 self.scalers[client.client_id], self.device
             )
-            all_rmse.append(metrics["RMSE"])
-            all_mae.append(metrics["MAE"])
-            all_wape.append(metrics.get("WAPE", 0))
+            per_client_metrics[client.client_id] = metrics
 
-        return {
+        # 基础宏平均 (所有站点等权)
+        all_rmse = [m["RMSE"] for m in per_client_metrics.values()]
+        all_mae = [m["MAE"] for m in per_client_metrics.values()]
+        all_wape = [m.get("WAPE", 0) for m in per_client_metrics.values()]
+
+        result = {
             "RMSE": np.mean(all_rmse),
             "MAE": np.mean(all_mae),
             "WAPE": np.mean(all_wape),
         }
+
+        # 多城市: 额外计算城市级宏平均
+        if is_multi_city and self.city_client_map:
+            city_rmse, city_mae, city_wape = [], [], []
+            for city in self.cities:
+                city_client_ids = [
+                    self.clients[idx].client_id
+                    for idx in self.city_client_map.get(city, [])
+                ]
+                if not city_client_ids:
+                    continue
+                city_vals_rmse = [
+                    per_client_metrics[cid]["RMSE"]
+                    for cid in city_client_ids if cid in per_client_metrics
+                ]
+                city_vals_mae = [
+                    per_client_metrics[cid]["MAE"]
+                    for cid in city_client_ids if cid in per_client_metrics
+                ]
+                city_vals_wape = [
+                    per_client_metrics[cid].get("WAPE", 0)
+                    for cid in city_client_ids if cid in per_client_metrics
+                ]
+                if city_vals_rmse:
+                    city_rmse.append(np.mean(city_vals_rmse))
+                    city_mae.append(np.mean(city_vals_mae))
+                    city_wape.append(np.mean(city_vals_wape))
+
+            if city_rmse:
+                result["macro_city_RMSE"] = np.mean(city_rmse)
+                result["macro_city_MAE"] = np.mean(city_mae)
+                result["macro_city_WAPE"] = np.mean(city_wape)
+
+        return result
 
     def _test_all_clients_with_preds(self, server) -> tuple:
         """在所有客户端的测试集上评估, 同时返回预测值"""
         results = {}
         predictions = {}
 
+        # 累积原始误差, 用于 Micro 指标 (全局 sum|y-pred| / sum|y|)
+        micro_abs_err = 0.0
+        micro_abs_target = 0.0
+        micro_sq_err = 0.0
+        micro_n = 0
+
         for i, client in enumerate(self.clients):
             if isinstance(server, ClusteredFLServer):
                 params = server.get_cluster_params(i)
+            elif isinstance(server, CityBalancedServer):
+                # 与 _evaluate_all_clients 一致: 用该客户端所属城市的聚合模型
+                client_city = client.client_id.split("_")[0]
+                city_params = server.get_city_params(client_city)
+                params = city_params if city_params else server.get_global_params()
             else:
                 params = server.get_global_params()
 
-            client.set_parameters(params)
+            # FedBN/LocalHead: 保留本地 BN/头, 只更新共享参数
+            client.set_parameters(
+                params,
+                exclude_names=(self.excluded_param_names
+                               if self.excluded_param_names else None))
+
             metrics, preds, targets = evaluate_model(
                 client.model, self.test_loaders[client.client_id],
                 self.scalers[client.client_id], self.device,
@@ -341,15 +701,18 @@ class FederatedTrainer:
             )
             results[client.client_id] = metrics
             predictions[client.client_id] = {"pred": preds, "target": targets}
+            micro_abs_err += float(np.sum(np.abs(preds - targets)))
+            micro_abs_target += float(np.sum(np.abs(targets)))
+            micro_sq_err += float(np.sum((preds - targets) ** 2))
+            micro_n += int(targets.size)
             print(f"  {client.client_id}: RMSE={metrics['RMSE']:.4f}, "
                   f"MAE={metrics['MAE']:.4f}, WAPE={metrics.get('WAPE', 0):.2f}%")
 
-        # 汇总: 宏平均 (每个站点等权重) + 微平均 (按样本数加权)
+        # 汇总: 宏平均 (每个站点等权重)
         macro_avg = {
             "RMSE": np.mean([m["RMSE"] for m in results.values()]),
             "MAE": np.mean([m["MAE"] for m in results.values()]),
         }
-        # 包含所有指标的平均
         for key in results[list(results.keys())[0]]:
             if key not in macro_avg:
                 vals = [m[key] for m in results.values() if key in m]
@@ -357,8 +720,69 @@ class FederatedTrainer:
                     macro_avg[key] = np.mean(vals)
 
         results["AVERAGE"] = macro_avg
-        print(f"\n  AVERAGE: RMSE={macro_avg['RMSE']:.4f}, "
+        print(f"\n  MACRO-STATION: RMSE={macro_avg['RMSE']:.4f}, "
               f"MAE={macro_avg['MAE']:.4f}, WAPE={macro_avg.get('WAPE', 0):.2f}%")
+
+        # Micro 指标 (所有站点样本合并计算, 反映自然数据分布)
+        results["micro"] = {
+            "WAPE": float(micro_abs_err / micro_abs_target * 100) if micro_abs_target > 0 else 0.0,
+            "RMSE": float(np.sqrt(micro_sq_err / micro_n)) if micro_n > 0 else 0.0,
+            "MAE": float(micro_abs_err / micro_n) if micro_n > 0 else 0.0,
+        }
+        print(f"  MICRO (all stations pooled): RMSE={results['micro']['RMSE']:.4f}, "
+              f"WAPE={results['micro']['WAPE']:.2f}%")
+
+        # 多城市: 额外计算城市级宏平均 (每城市等权, 论文主指标)
+        is_multi_city = len(self.cities) > 1
+        if is_multi_city and self.city_client_map:
+            per_city_metrics = {}
+            city_rmse_list, city_mae_list, city_wape_list = [], [], []
+            for city in self.cities:
+                city_client_ids = [
+                    self.clients[idx].client_id
+                    for idx in self.city_client_map.get(city, [])
+                ]
+                city_vals = {
+                    cid: results[cid]
+                    for cid in city_client_ids if cid in results
+                }
+                if not city_vals:
+                    continue
+                city_avg = {}
+                for key in ["RMSE", "MAE", "WAPE", "SMAPE", "NRMSE", "MAPE_raw"]:
+                    vals = [m[key] for m in city_vals.values() if key in m]
+                    if vals:
+                        city_avg[key] = float(np.mean(vals))
+                city_rmse_list.append(city_avg["RMSE"])
+                city_mae_list.append(city_avg["MAE"])
+                city_wape_list.append(city_avg.get("WAPE", 0))
+                per_city_metrics[city] = city_avg
+                print(f"  {city}: RMSE={city_avg['RMSE']:.4f}, "
+                      f"MAE={city_avg['MAE']:.4f}, WAPE={city_avg.get('WAPE', 0):.2f}%")
+
+            results["macro_city"] = {
+                "RMSE": float(np.mean(city_rmse_list)),
+                "MAE": float(np.mean(city_mae_list)),
+                "WAPE": float(np.mean(city_wape_list)),
+            }
+            results["per_city"] = per_city_metrics
+
+            # 公平性指标: 最差城市 WAPE
+            worst_city = max(per_city_metrics.items(),
+                             key=lambda kv: kv[1].get("WAPE", 0))
+            results["worst_city"] = {
+                "city": worst_city[0],
+                "WAPE": worst_city[1].get("WAPE", 0),
+                "RMSE": worst_city[1].get("RMSE", 0),
+                "MAE": worst_city[1].get("MAE", 0),
+            }
+            print(f"  WORST-CITY: {worst_city[0]} "
+                  f"WAPE={worst_city[1].get('WAPE', 0):.2f}%")
+
+            print(f"\n  MACRO-CITY (paper primary): "
+                  f"RMSE={results['macro_city']['RMSE']:.4f}, "
+                  f"MAE={results['macro_city']['MAE']:.4f}, "
+                  f"WAPE={results['macro_city']['WAPE']:.2f}%")
 
         return results, predictions
 
@@ -379,10 +803,39 @@ class FederatedTrainer:
         with open(os.path.join(self.run_dir, "metrics.json"), "w") as f:
             json.dump(test_results, f, indent=2, default=str)
 
+        # 保存聚合验收信息 (N_c / β_c / 第一轮模型哈希) —— 问题与解决3.txt 第三节三层证据
+        total_nc = sum(self.city_data_sizes.values())
+        meta = {
+            "alpha": getattr(self.cfg.fed, "city_weight_alpha", None),
+            "station_selection": self.cfg.data.station_selection,
+            "cities": list(self.cities),
+            "per_city": {},
+            "city_weights": self._city_weights,
+            "first_round_hash": self.first_round_hash,
+        }
+        for c in self.cities:
+            meta["per_city"][c] = {
+                "n_stations": len(self.city_client_map.get(c, [])),
+                "N_c": float(self.city_data_sizes.get(c, 0.0)),
+                "data_fraction": (float(self.city_data_sizes.get(c, 0.0) / total_nc)
+                                  if total_nc > 0 else 0.0),
+            }
+        with open(os.path.join(self.run_dir, "aggregation_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2, default=str)
+
         # 保存最佳模型
         if self.best_model_state is not None:
             self.tracker.save_best_model(
                 self.clients[0].model, self.best_val_rmse)
+
+        # FedBN/LocalHead: 同时保存所有客户端的本地 BN/头 (个性化参数),
+        # 否则只存 client[0] 会丢失其余站点的预测头。
+        if self.excluded_param_names:
+            local_models = {
+                client.client_id: client.model.state_dict()
+                for client in self.clients
+            }
+            torch.save(local_models, os.path.join(self.run_dir, "local_models.pt"))
 
         # 保存预测值
         if predictions:

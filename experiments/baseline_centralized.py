@@ -1,8 +1,9 @@
 """
-Baseline: Centralized Training (集中式训练)
+Baseline: Centralized Training — Shared (集中式共享)
 
-所有站点数据合并训练单个 TCN-LSTM 模型。
-这是联邦学习的理论上限 — 没有隐私/通信约束时的最佳效果。
+所有站点数据合并训练单个 TCN-LSTM 模型, 使用单一全局 target scaler。
+注意: 这不是「理论上限」, 只是集中式共享模型 (问题与解决3.txt 第六节);
+真正的性能参考上限见 baseline_centralized_personalized.py (共享主干+每站头)。
 """
 import sys
 import os
@@ -20,19 +21,27 @@ from src.data.feature_engineering import prepare_station_data, TimeSeriesScaler
 from src.models.tcn_lstm import build_model
 from src.utils.metrics import evaluate_model, set_seed
 
+TIMEZONE_OFFSETS = {"SZH": 8, "AMS": 2, "JHB": 2, "LOA": -7, "MEL": 10, "SPO": -3}
+
 
 def train_centralized(city: str = "SZH", top_k: int = 20,
                       epochs: int = 100, lr: float = 1e-3,
                       seed: int = 42, output_dir: str = None):
     """
     Centralized baseline: 合并所有站点训练数据, 训练单个模型
+
+    与 local_only 的关键区别:
+      - 使用全局 target 归一化 (所有站点共享一个 scaler)
+      - 按站点等权采样 (防止大站 dominate loss)
     """
+    from sklearn.preprocessing import StandardScaler
+
     cfg = Config()
     cfg.data.top_k_stations = top_k
-    set_seed(cfg.seed)
+    set_seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    run_dir = get_run_dir(city, "centralized", seed,
+    run_dir = get_run_dir(city, "centralized_shared", seed,
                           base_dir=output_dir or cfg.output_dir)
 
     city_data = load_city_data(DATA_DIR, city, cfg.data.use_remove_zero)
@@ -41,20 +50,50 @@ def train_centralized(city: str = "SZH", top_k: int = 20,
         train_ratio=cfg.data.train_ratio + cfg.data.val_ratio
     )
 
-    # 收集所有站点的训练/测试数据
+    tz = TIMEZONE_OFFSETS.get(city, 0)
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 1: 在所有站点训练数据上 fit 全局 target scaler
+    # ═══════════════════════════════════════════════════════════
+    all_train_targets_raw = []
+    for sid in stations:
+        df = build_station_dataframe(city_data, sid, cfg.data.time_col,
+                                     timezone_offset=tz,
+                                     price_normalization=True,
+                                     add_load_norm=True)
+        target = df["target"].values
+        n_train_end = int(len(target) * (cfg.data.train_ratio + cfg.data.val_ratio))
+        all_train_targets_raw.append(target[:n_train_end])
+
+    global_target_scaler = StandardScaler()
+    global_target_scaler.fit(
+        np.concatenate(all_train_targets_raw).reshape(-1, 1))
+    print(f"  Global target scaler: "
+          f"mean={global_target_scaler.mean_[0]:.2f}, "
+          f"std={global_target_scaler.scale_[0]:.2f}")
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 2: 用全局 scaler 创建各站点数据集
+    # ═══════════════════════════════════════════════════════════
     all_train_datasets = []
-    per_station_test = {}  # 每个站点仍需单独评估
+    station_sample_counts = {}  # 用于加权
+    per_station_test = {}
     per_station_scaler = {}
 
     for sid in stations:
-        df = build_station_dataframe(city_data, sid, cfg.data.time_col)
+        df = build_station_dataframe(city_data, sid, cfg.data.time_col,
+                                     timezone_offset=tz,
+                                     price_normalization=True,
+                                     add_load_norm=True)
         train_ds, val_ds, test_ds, scaler = prepare_station_data(
-            df, cfg.data.seq_len, cfg.data.pred_len)
+            df, cfg.data.seq_len, cfg.data.pred_len,
+            external_target_scaler=global_target_scaler)
 
         if len(train_ds) == 0:
             continue
 
         all_train_datasets.append(train_ds)
+        station_sample_counts[sid] = len(train_ds)
         per_station_test[sid] = test_ds
         per_station_scaler[sid] = scaler
 
@@ -63,7 +102,22 @@ def train_centralized(city: str = "SZH", top_k: int = 20,
 
     # 合并所有训练集
     merged_train = ConcatDataset(all_train_datasets)
-    train_loader = DataLoader(merged_train, batch_size=64, shuffle=True)
+
+    # 计算每站等权的样本权重
+    n_stations = len(all_train_datasets)
+    total_samples = sum(station_sample_counts.values())
+    sample_weights = []
+    for i, ds in enumerate(all_train_datasets):
+        n_s = len(ds)
+        # 每站贡献相等的总权重 → w = total / (n_stations * n_s)
+        w = total_samples / (n_stations * n_s)
+        sample_weights.extend([w] * n_s)
+
+    # WeightedRandomSampler: 按站等权采样
+    from torch.utils.data import WeightedRandomSampler
+    sampler = WeightedRandomSampler(
+        sample_weights, num_samples=len(sample_weights), replacement=True)
+    train_loader = DataLoader(merged_train, batch_size=64, sampler=sampler)
 
     input_dim = merged_train[0][0].shape[1]
     model = build_model(input_dim, cfg.data.pred_len, cfg.model)
@@ -75,8 +129,12 @@ def train_centralized(city: str = "SZH", top_k: int = 20,
     print(f"\n  Centralized Training: {len(stations)} stations, "
           f"{len(merged_train)} windows")
     print(f"  Epochs: {epochs}, LR: {lr}")
+    print(f"  Sample weights: range [{min(sample_weights):.2f}, "
+          f"{max(sample_weights):.2f}] (per-station equal weight)")
 
-    # 训练
+    # ═══════════════════════════════════════════════════════════
+    # Phase 3: 训练
+    # ═══════════════════════════════════════════════════════════
     history = {"epoch": [], "loss": []}
     for epoch in range(epochs):
         model.train()
@@ -100,7 +158,9 @@ def train_centralized(city: str = "SZH", top_k: int = 20,
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(f"  Epoch {epoch+1:3d}/{epochs} | Loss: {avg_loss:.4f}")
 
-    # 测试 (每个站点独立评估)
+    # ═══════════════════════════════════════════════════════════
+    # Phase 4: 测试 (每个站点用全局 scaler 独立评估)
+    # ═══════════════════════════════════════════════════════════
     model.to("cpu")
     results = {}
     predictions = {}
@@ -133,7 +193,6 @@ def train_centralized(city: str = "SZH", top_k: int = 20,
         json.dump(history, f, indent=2)
     with open(os.path.join(run_dir, "metrics.json"), "w") as f:
         json.dump(results, f, indent=2, default=str)
-    # 保存模型
     torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pt"))
 
     print(f"\n  Results saved to {run_dir}")

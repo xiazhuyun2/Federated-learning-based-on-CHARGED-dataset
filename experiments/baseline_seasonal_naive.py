@@ -16,6 +16,8 @@ from src.data.data_loader import load_city_data, select_top_stations, build_stat
 from src.data.feature_engineering import prepare_station_data
 from src.utils.metrics import compute_metrics, set_seed
 
+TIMEZONE_OFFSETS = {"SZH": 8, "AMS": 2, "JHB": 2, "LOA": -7, "MEL": 10, "SPO": -3}
+
 
 def evaluate_seasonal_naive(city: str = "SZH", top_k: int = 20,
                             seed: int = 42, output_dir: str = None):
@@ -25,7 +27,7 @@ def evaluate_seasonal_naive(city: str = "SZH", top_k: int = 20,
     """
     cfg = Config()
     cfg.data.top_k_stations = top_k
-    set_seed(cfg.seed)
+    set_seed(seed)
 
     run_dir = get_run_dir(city, "seasonal_naive", seed,
                           base_dir=output_dir or cfg.output_dir)
@@ -39,8 +41,13 @@ def evaluate_seasonal_naive(city: str = "SZH", top_k: int = 20,
     results = {}
     predictions = {}
 
+    tz = TIMEZONE_OFFSETS.get(city, 0)
+
     for sid in stations:
-        df = build_station_dataframe(city_data, sid, cfg.data.time_col)
+        df = build_station_dataframe(city_data, sid, cfg.data.time_col,
+                                     timezone_offset=tz,
+                                     price_normalization=True,
+                                     add_load_norm=True)
         train_ds, val_ds, test_ds, scaler = prepare_station_data(
             df, cfg.data.seq_len, cfg.data.pred_len)
 

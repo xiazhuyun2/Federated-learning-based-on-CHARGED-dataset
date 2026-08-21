@@ -29,6 +29,9 @@ def parse_args():
     parser.add_argument("--city", type=str, default="SZH",
                         choices=["SZH", "AMS", "JHB", "LOA", "MEL", "SPO"],
                         help="City to use (default: SZH)")
+    parser.add_argument("--cities", type=str, default=None,
+                        help="Comma-separated cities for multi-city FL "
+                        "(e.g. SZH,AMS,JHB)")
     parser.add_argument("--aggregation", type=str, default="fedprox",
                         choices=["fedavg", "fedprox", "clustered"],
                         help="Federated aggregation strategy")
@@ -64,6 +67,19 @@ def parse_args():
     parser.add_argument("--finetune_epochs", type=int, default=0,
                         help="Local fine-tuning epochs after global training")
 
+    # 多城市 / 分层联邦参数
+    parser.add_argument("--city_weight_alpha", type=float, default=0.5,
+                        help="City balance exponent: 0=equal, 1=sample-weighted, "
+                        "0.5=compromise (default: 0.5)")
+    parser.add_argument("--no_city_balance", action="store_true",
+                        help="Disable city-balanced aggregation (use standard FedAvg)")
+    parser.add_argument("--station_selection", type=str, default="top_k",
+                        choices=["top_k", "stratified_natural", "stratified_balanced",
+                                 "proportional"],
+                        help="Station selection strategy (default: top_k)")
+    parser.add_argument("--min_city_clients", type=int, default=2,
+                        help="Min clients per city for proportional allocation (default: 2)")
+
     # 运行参数
     parser.add_argument("--device", type=str, default="auto",
                         choices=["auto", "cuda", "cpu"],
@@ -88,12 +104,21 @@ def run_single(cfg: Config, args, seed: int):
     else:
         cfg.device = args.device
 
-    # 生成唯一输出目录
+    # 生成唯一输出目录 (method 名含 α 和 单/多城市 标记, 避免不同实验互相覆盖)
     method = args.aggregation
     if args.fedbn:
         method += "_fedbn"
     if args.local_head:
         method += "_localhead"
+    if args.cities:
+        # 使用 cfg.fed.city_weight_alpha (已含 --no_city_balance 的处理), 0.5 -> 0_5
+        alpha_tag = f"{cfg.fed.city_weight_alpha:g}".replace(".", "_")
+        method += f"_a{alpha_tag}"
+        # 场景A(分层抽样)与场景B(比例分配)在相同 α 下会产生相同方法名,
+        # 必须用选站策略区分目录, 否则两场景结果互相覆盖。
+        method += f"_{args.station_selection}"
+    else:
+        method += "_single"
     run_dir = get_run_dir(args.city, method, seed,
                           base_dir=args.output_dir)
 
@@ -122,7 +147,14 @@ def run_single(cfg: Config, args, seed: int):
     # 训练
     trainer = FederatedTrainer(cfg, run_dir=run_dir,
                                city=args.city, method=method)
-    trainer.prepare_city_clients(args.city)
+
+    # 判断单城市还是多城市
+    if args.cities:
+        cities_list = [c.strip() for c in args.cities.split(",")]
+        trainer.prepare_multi_city_clients(cities_list)
+    else:
+        trainer.prepare_city_clients(args.city)
+
     results = trainer.run_federated_training()
 
     print("\n  Done!")
@@ -148,6 +180,21 @@ def main():
     cfg.fed.finetune_epochs = args.finetune_epochs
     cfg.model.use_fedbn = args.fedbn
     cfg.model.use_local_head = args.local_head
+
+    # 多城市配置
+    cfg.data.station_selection = args.station_selection
+    cfg.data.min_city_clients = args.min_city_clients
+    if args.cities:
+        cfg.data.cities = [c.strip() for c in args.cities.split(",")]
+        cfg.fed.multi_city_mode = "multi_city"
+    else:
+        # 单城市运行必须记录实际城市, 否则 cfg.data.cities 默认的 6 城会让
+        # organize_results 把单城市结果误判为多城市 (n_cities>=2)。
+        cfg.data.cities = [args.city]
+    if args.no_city_balance:
+        cfg.fed.city_weight_alpha = 1.0  # 退化为标准样本加权
+    else:
+        cfg.fed.city_weight_alpha = args.city_weight_alpha
 
     if args.output_dir:
         cfg.output_dir = args.output_dir

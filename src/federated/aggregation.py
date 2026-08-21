@@ -32,8 +32,21 @@ class FLClient:
     def get_parameters(self) -> OrderedDict:
         return copy.deepcopy(self.model.state_dict())
 
-    def set_parameters(self, params: OrderedDict):
-        self.model.load_state_dict(params)
+    def set_parameters(self, params: OrderedDict,
+                       exclude_names: Optional[List[str]] = None):
+        """
+        加载参数; 若 exclude_names 非空, 跳过这些 key 以保留本地参数
+        (用于 FedBN / 本地预测头: 广播共享参数时不覆盖本地 BN/头)。
+        """
+        if not exclude_names:
+            self.model.load_state_dict(params)
+            return
+        exclude_set = set(exclude_names)
+        local = self.model.state_dict()
+        for key, val in params.items():
+            if key not in exclude_set:
+                local[key] = val
+        self.model.load_state_dict(local)
 
     def train_local(self, epochs: int, lr: float, weight_decay: float,
                     global_params: Optional[OrderedDict] = None,
@@ -383,3 +396,160 @@ class ClusteredFLServer:
         if cluster_idx < len(self.cluster_models):
             return copy.deepcopy(self.cluster_models[cluster_idx])
         return self.get_global_params()
+
+
+# ============================================================
+# City-Balanced Server — 多城市平衡聚合
+# ============================================================
+
+class CityBalancedServer(FLServer):
+    """
+    城市平衡聚合服务器
+
+    实现 "城市内站点聚合 → 城市间平衡聚合" 的简化两级方案。
+
+    支持三种加权策略:
+      α=0.0: 六城市等权 (所有城市平等)
+      α=0.5: 折中方案 (推荐, 论文主方法)
+      α=1.0: 传统样本量加权 (退化为 FedAvg, SZH 主导)
+
+    权重公式: β_c ∝ N_c^α, where N_c = sum of data sizes for all stations in city c
+
+    Usage:
+      server = CityBalancedServer(global_model, alpha=0.5, aggregation="fedprox")
+      server.set_city_groups(city_client_map, client_data_sizes)
+      server.aggregate(client_params_list, client_weights, city_indices, ...)
+    """
+
+    def __init__(self, global_model: nn.Module, alpha: float = 0.5,
+                 aggregation: str = "fedprox"):
+        super().__init__(global_model, aggregation)
+        self.alpha = alpha
+        self.city_names: List[str] = []
+        self.city_weights: Dict[str, float] = {}  # city_name -> normalized weight
+        self.per_city_params: Dict[str, OrderedDict] = {}  # city_name -> city_model
+
+    def set_city_groups(self, city_names: List[str],
+                        city_data_sizes: Dict[str, float]):
+        """
+        设置城市分组并计算城市权重
+
+        Args:
+            city_names: 城市名列表 (去重)
+            city_data_sizes: {city: total_data_size} (N_c)
+        """
+        self.city_names = sorted(city_names)
+
+        # 计算城市权重 β_c ∝ N_c^α
+        n_cities = len(self.city_names)
+        if n_cities == 0:
+            return
+
+        raw_weights = {}
+        for c in self.city_names:
+            n_c = max(city_data_sizes.get(c, 1.0), 1.0)
+            if self.alpha == 0.0:
+                raw_weights[c] = 1.0
+            elif self.alpha == 1.0:
+                raw_weights[c] = n_c
+            else:
+                raw_weights[c] = n_c ** self.alpha
+
+        total = sum(raw_weights.values())
+        self.city_weights = {c: w / total for c, w in raw_weights.items()}
+
+        print(f"  City-Balanced Weights (α={self.alpha}):")
+        for c in self.city_names:
+            print(f"    {c}: {self.city_weights[c]:.4f} "
+                  f"(N={city_data_sizes.get(c, 0):.0f})")
+
+    def aggregate_with_city_balance(
+        self,
+        client_params_list: List[OrderedDict],
+        client_weights: List[float],
+        client_city_map: List[str],  # client_i -> city_name
+        exclude_param_names: Optional[List[str]] = None,
+    ):
+        """
+        城市平衡聚合:
+          Step 1: 每个城市内部加权平均 → city_model
+          Step 2: 按城市权重 β_c 加权聚合 → global_model
+
+        Args:
+            client_params_list: 所有客户端参数
+            client_weights: 客户端数据量
+            client_city_map: 每个客户端所属城市 (len = len(client_params_list))
+            exclude_param_names: 不参与聚合的参数名
+        """
+        exclude_set = set(exclude_param_names) if exclude_param_names else set()
+
+        # Step 1: 每个城市内部先聚合
+        city_params = {}        # {city: OrderedDict}
+        city_total_weight = {}  # {city: sum_of_weights}
+
+        for i, (params, w, city) in enumerate(zip(
+                client_params_list, client_weights, client_city_map)):
+            w_float = float(w)
+            if city not in city_params:
+                city_params[city] = OrderedDict()
+                city_total_weight[city] = 0.0
+
+            for key in params:
+                if key not in city_params[city]:
+                    city_params[city][key] = 0.0
+                city_params[city][key] += params[key].float() * w_float
+            city_total_weight[city] += w_float
+
+        # 归一化每个城市的聚合参数
+        for city in city_params:
+            tw = max(city_total_weight[city], 1e-8)
+            for key in city_params[city]:
+                city_params[city][key] = city_params[city][key] / tw
+
+        self.per_city_params = copy.deepcopy(city_params)
+
+        # Step 2: 按城市权重加权聚合到全局模型
+        new_params = OrderedDict()
+        for key in client_params_list[0]:
+            if key in exclude_set:
+                new_params[key] = self.global_model.state_dict()[key].clone()
+            else:
+                new_params[key] = 0.0
+                for city in self.city_names:
+                    if city in city_params and city in self.city_weights:
+                        new_params[key] += (
+                            city_params[city][key].float()
+                            * self.city_weights[city]
+                        )
+                # 处理有新客户端城市但不在 self.city_names 的情况
+                # (不应发生, 但做防护)
+                all_city_weight = sum(
+                    self.city_weights.get(c, 0)
+                    for c in city_params if c in self.city_weights
+                )
+                if all_city_weight < 0.99 and all_city_weight > 0:
+                    # 重新归一化
+                    new_params[key] = new_params[key] / all_city_weight
+
+        self.global_model.load_state_dict(new_params)
+
+    def aggregate(self, client_params_list, client_weights,
+                  exclude_param_names=None, **kwargs):
+        """
+        兼容旧接口: 如果不传 client_city_map, 退化为标准 FedAvg/FedProx
+        """
+        client_city_map = kwargs.get("client_city_map", None)
+        if client_city_map and self.city_weights:
+            self.aggregate_with_city_balance(
+                client_params_list, client_weights,
+                client_city_map, exclude_param_names)
+        else:
+            # Fallback to standard aggregation
+            super().aggregate(client_params_list, client_weights,
+                              exclude_param_names)
+
+    def get_city_params(self, city: str) -> Optional[OrderedDict]:
+        """获取某个城市的聚合模型参数"""
+        if city in self.per_city_params:
+            return copy.deepcopy(self.per_city_params[city])
+        return None

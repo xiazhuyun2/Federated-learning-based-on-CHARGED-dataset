@@ -190,18 +190,20 @@ def plot_station_comparison(test_results: Dict, output_dir: str) -> str:
     图4: 各站点指标对比条形图
     每个站点的 RMSE / MAE / WAPE 并排柱状图
     """
-    # 过滤掉 AVERAGE
-    stations = {k: v for k, v in test_results.items() if k != "AVERAGE"}
+    # 过滤掉 AVERAGE 和多城市汇总键
+    _meta_keys = {"AVERAGE", "macro_city", "per_city", "micro", "worst_city"}
+    stations = {k: v for k, v in test_results.items()
+                if k not in _meta_keys and isinstance(v, dict) and "RMSE" in v}
     if not stations:
         return ""
 
     names = list(stations.keys())
     rmse = [stations[n]["RMSE"] for n in names]
     mae = [stations[n]["MAE"] for n in names]
-    # 兼容 MAPE 或 WAPE
+    # 兼容 MAPE 或 WAPE (所有站点指标来自 evaluate_model, 均含 MAPE)
     error_key = "MAPE" if "MAPE" in list(stations.values())[0] else "WAPE"
     error_label = "MAPE (%)" if error_key == "MAPE" else "WAPE (%)"
-    error_vals = [stations[n][error_key] for n in names]
+    error_vals = [stations[n].get(error_key, float("nan")) for n in names]
 
     x = np.arange(len(names))
     width = 0.25
@@ -397,5 +399,215 @@ def generate_all_plots(history: Dict, test_results: Dict, output_dir: str):
 
     generated = [p for p in paths if p]
     print(f"\n  Generated {len(generated)} plots:")
+    for p in generated:
+        print(f"    - {p}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 多城市可视化 (Phase F)
+# ═══════════════════════════════════════════════════════════════
+
+CITY_COLORS = {
+    "SZH": "#1976D2", "AMS": "#F44336", "JHB": "#4CAF50",
+    "LOA": "#FF9800", "MEL": "#9C27B0", "SPO": "#00BCD4",
+}
+
+
+def plot_city_comparison(per_city_metrics: Dict[str, Dict],
+                         output_dir: str,
+                         title: str = "Per-City Performance Comparison") -> str:
+    """
+    多城市并排柱状图 — 每城市 RMSE/MAE/WAPE 一组
+
+    Args:
+        per_city_metrics: {city_name: {"RMSE": ..., "MAE": ..., "WAPE": ...}}
+    """
+    if not per_city_metrics:
+        return ""
+
+    cities = sorted(per_city_metrics.keys())
+    metrics_keys = ["RMSE", "MAE", "WAPE"]
+    n_cities = len(cities)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    bar_colors = [CITY_COLORS.get(c, COLORS["gray"]) for c in cities]
+
+    for ax_idx, metric in enumerate(metrics_keys):
+        ax = axes[ax_idx]
+        values = [per_city_metrics[c].get(metric, 0) for c in cities]
+        bars = ax.bar(cities, values, color=bar_colors, alpha=0.85, edgecolor="white")
+        ax.set_title(metric, fontsize=13, fontweight="bold")
+        ax.set_ylabel(metric)
+        ax.tick_params(axis="x", rotation=30)
+
+        # 标注数值
+        for bar, val in zip(bars, values):
+            if val > 0 and np.isfinite(val):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(values) * 0.02,
+                        f"{val:.1f}", ha="center", va="bottom", fontsize=8)
+
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+    plt.tight_layout()
+
+    path = os.path.join(output_dir, "city_comparison.png")
+    fig.savefig(path, bbox_inches="tight", dpi=200)
+    plt.close(fig)
+    return path
+
+
+def plot_method_ranking(methods_results: Dict[str, Dict],
+                        output_dir: str,
+                        metric: str = "RMSE") -> str:
+    """
+    方法排名条形图 (含误差棒, 用于多种子结果)
+
+    Args:
+        methods_results: {method_name: {metric: {"mean": ..., "std": ...}}}
+    """
+    if not methods_results:
+        return ""
+
+    # 按指标值排序
+    ranked = sorted(
+        methods_results.items(),
+        key=lambda x: x[1].get(metric, {}).get("mean", float("inf"))
+        if isinstance(x[1].get(metric), dict) else x[1].get(metric, float("inf"))
+    )
+
+    names = [name.replace("multi/", "").replace("_", "\n") for name, _ in ranked]
+    means = []
+    stds = []
+    for _, m in ranked:
+        val = m.get(metric, {})
+        if isinstance(val, dict):
+            means.append(val.get("mean", 0))
+            stds.append(val.get("std", 0))
+        else:
+            means.append(val if val and val != float("inf") else 0)
+            stds.append(0)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = np.arange(len(names))
+    colors_list = [COLORS["primary"]] * len(names)
+    # 标记最好的方法
+    if len(colors_list) > 0:
+        colors_list[0] = COLORS["accent"]
+
+    bars = ax.barh(x, means, xerr=stds, color=colors_list, alpha=0.85,
+                   edgecolor="white", capsize=3)
+    ax.set_yticks(x)
+    ax.set_yticklabels(names, fontsize=9)
+    ax.invert_yaxis()
+    ax.set_xlabel(metric)
+    ax.set_title(f"Method Comparison — {metric}\n(lower is better)",
+                 fontsize=13, fontweight="bold")
+
+    # 标注数值
+    for bar, mean, std in zip(bars, means, stds):
+        if mean > 0:
+            label = f"{mean:.1f}±{std:.1f}" if std > 0 else f"{mean:.1f}"
+            ax.text(mean + std + max(means) * 0.01, bar.get_y() + bar.get_height() / 2,
+                    label, va="center", fontsize=7)
+
+    plt.tight_layout()
+    path = os.path.join(output_dir, "method_ranking.png")
+    fig.savefig(path, bbox_inches="tight", dpi=200)
+    plt.close(fig)
+    return path
+
+
+def plot_horizon_error(horizon_metrics: Dict[str, Dict],
+                       output_dir: str) -> str:
+    """
+    各方法随预测步长增加的误差曲线
+
+    Args:
+        horizon_metrics:
+          {method: {1: rmse_1h, 6: rmse_6h, 12: rmse_12h, 24: rmse_24h}}
+    """
+    if not horizon_metrics:
+        return ""
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    horizons = [1, 6, 12, 24]
+    colors_list = [COLORS["primary"], COLORS["secondary"],
+                   COLORS["accent"], COLORS["orange"],
+                   COLORS["purple"], COLORS["gray"]]
+
+    for i, (method, metrics) in enumerate(horizon_metrics.items()):
+        rmse_vals = [metrics.get(h, metrics.get(f"RMSE@{h}h", float("nan")))
+                     for h in horizons]
+        color = colors_list[i % len(colors_list)]
+        label = method.replace("multi/", "").replace("_", " ")
+        ax.plot(horizons, rmse_vals, "o-", linewidth=2, markersize=6,
+                color=color, label=label)
+
+    ax.set_xlabel("Prediction Horizon (hours)")
+    ax.set_ylabel("RMSE")
+    ax.set_title("Error Growth over Prediction Horizon", fontsize=13, fontweight="bold")
+    ax.set_xticks(horizons)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(output_dir, "horizon_error.png")
+    fig.savefig(path, bbox_inches="tight", dpi=200)
+    plt.close(fig)
+    return path
+
+
+def plot_city_daily_profiles(profiles: Dict[str, list],
+                             output_dir: str) -> str:
+    """
+    多城市标准化日负荷曲线叠加图
+
+    Args:
+        profiles: {city: [24 floats]} normalized daily load profile
+    """
+    if not profiles:
+        return ""
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    hours = range(24)
+
+    for city, profile in sorted(profiles.items()):
+        if profile and len(profile) >= 24:
+            color = CITY_COLORS.get(city, COLORS["gray"])
+            ax.plot(hours, profile[:24], color=color, linewidth=2,
+                    label=city, alpha=0.85)
+
+    ax.set_xlabel("Hour of Day")
+    ax.set_ylabel("Normalized Load")
+    ax.set_title("Normalized Daily Load Profiles by City",
+                 fontsize=13, fontweight="bold")
+    ax.set_xticks(range(0, 24, 3))
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.2)
+
+    plt.tight_layout()
+    path = os.path.join(output_dir, "daily_profiles.png")
+    fig.savefig(path, bbox_inches="tight", dpi=200)
+    plt.close(fig)
+    return path
+
+
+def generate_multicity_plots(history: Dict, test_results: Dict,
+                             output_dir: str):
+    """一键生成多城市训练完成后的所有图表 (扩展版)"""
+    os.makedirs(output_dir, exist_ok=True)
+
+    paths = []
+    paths.append(plot_training_loss(history, output_dir))
+    paths.append(plot_val_metrics(history, output_dir))
+    paths.append(plot_station_comparison(test_results, output_dir))
+
+    # 多城市特有图表
+    per_city = test_results.get("per_city", {})
+    if per_city and not any(k.startswith("per_city/") for k in per_city):
+        paths.append(plot_city_comparison(per_city, output_dir))
+
+    generated = [p for p in paths if p]
+    print(f"\n  Generated {len(generated)} multi-city plots:")
     for p in generated:
         print(f"    - {p}")

@@ -18,20 +18,22 @@ env/
 *.swp
 *.swo
 
+# Claude Code local config / memory
+.claude/
+
 # Jupyter
 .ipynb_checkpoints/
 
-# Outputs (results are in repo, but exclude generated runs)
-outputs/*/seed_*/
-outputs/hyperparam_search/
-outputs/summaries/
+# Generated experiment outputs (large: model checkpoints, predictions, plots)
+# 关键结果已单独抽取到 results/ 目录
+outputs/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Data files (638MB, too large for git)
-data/
+# Raw data files (638MB, too large for git) — root only, keep src/data/ source code
+/data/
 
-# Paper PDFs (exclude from git if large)
-# paper/*.pdf
+# Paper PDFs (reference papers, exclude from git)
+paper/*.pdf

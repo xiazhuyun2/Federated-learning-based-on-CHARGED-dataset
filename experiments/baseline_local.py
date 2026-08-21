@@ -19,6 +19,8 @@ from src.data.feature_engineering import prepare_station_data
 from src.models.tcn_lstm import build_model
 from src.utils.metrics import evaluate_model, set_seed, compute_metrics
 
+TIMEZONE_OFFSETS = {"SZH": 8, "AMS": 2, "JHB": 2, "LOA": -7, "MEL": 10, "SPO": -3}
+
 
 def train_local_only(city: str = "SZH", top_k: int = 20,
                      epochs: int = 100, lr: float = 1e-3,
@@ -29,7 +31,7 @@ def train_local_only(city: str = "SZH", top_k: int = 20,
     cfg = Config()
     cfg.data.top_k_stations = top_k
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    set_seed(cfg.seed)
+    set_seed(seed)
 
     run_dir = get_run_dir(city, "local_only", seed,
                           base_dir=output_dir or cfg.output_dir)
@@ -43,8 +45,13 @@ def train_local_only(city: str = "SZH", top_k: int = 20,
     results = {}
     predictions = {}
 
+    tz = TIMEZONE_OFFSETS.get(city, 0)
+
     for sid in stations:
-        df = build_station_dataframe(city_data, sid, cfg.data.time_col)
+        df = build_station_dataframe(city_data, sid, cfg.data.time_col,
+                                     timezone_offset=tz,
+                                     price_normalization=True,
+                                     add_load_norm=True)
         train_ds, val_ds, test_ds, scaler = prepare_station_data(
             df, cfg.data.seq_len, cfg.data.pred_len)
 
