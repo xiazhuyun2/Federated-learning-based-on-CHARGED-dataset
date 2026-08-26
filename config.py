@@ -63,10 +63,11 @@ class DataConfig:
     station_selection: str = "top_k"       # "top_k" | "stratified_natural" | "stratified_balanced" | "proportional"
     min_city_clients: int = 2              # proportional 分配时每城保底客户端数
     price_normalization: bool = True       # 电价城市内标准化
-    load_normalization: bool = True        # 添加 per-charger 和 load_rate 特征
+    load_normalization: bool = True        # 添加 per-charger 特征 (load_rate 因全时段泄漏已移除)
+    # CHARGED 数据时间戳已是各城市本地时间, 不再做 UTC 偏移 (原二次偏移会整体移位小时/星期特征)
     timezone_offsets: dict = field(default_factory=lambda: {
-        "SZH": 8, "AMS": 2, "JHB": 2,
-        "LOA": -7, "MEL": 10, "SPO": -3,
+        "SZH": 0, "AMS": 0, "JHB": 0,
+        "LOA": 0, "MEL": 0, "SPO": 0,
     })
 
 

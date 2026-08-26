@@ -223,6 +223,16 @@ def main():
     else:
         run_single(cfg, args, args.seed)
 
+    # Windows + torch/CUDA 在解释器关闭阶段偶发崩溃 (exit 127 = ERROR_PROC_NOT_FOUND),
+    # 会让外层 shell 脚本把"已成功跑完"误判为失败而中止续跑。这里显式 flush 后强制
+    # 干净退出, 绕过 Py_Finalize 阶段的 CUDA 析构 (结果已在 run_single 内落盘,
+    # 全项目无 atexit 依赖, 安全)。
+    import sys as _sys
+    _sys.stdout.flush()
+    _sys.stderr.flush()
+    import os as _os
+    _os._exit(0)
+
 
 if __name__ == "__main__":
     main()

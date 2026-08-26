@@ -64,11 +64,15 @@ def _allocate_budget(city_sizes, total_budget, min_city=2):
     return alloc
 
 
-def _forward_backbone_head(shared, head, x):
+def _forward_backbone(shared, x):
+    """主干前向一次: TCN -> LSTM -> 取最后时刻. 各样本在 batch 维独立, 可整批并行."""
     tcn_out = shared.tcn(x.permute(0, 2, 1)).permute(0, 2, 1)
     lstm_out, _ = shared.lstm(tcn_out)
-    last = lstm_out[:, -1, :]
-    return head(last)
+    return lstm_out[:, -1, :]
+
+
+def _forward_backbone_head(shared, head, x):
+    return head(_forward_backbone(shared, x))
 
 
 def train_centralized_personalized(cities, top_k=20, epochs=100, lr=1e-3,
@@ -170,10 +174,11 @@ def train_centralized_personalized(cities, top_k=20, epochs=100, lr=1e-3,
         total_batches = 0
         for x, y, sidx in train_loader:
             x, y, sidx = x.to(device), y.to(device), sidx.to(device)
+            z = _forward_backbone(shared, x)          # 主干整批只跑一次 (原每站各跑一次)
             preds = torch.zeros_like(y)
             for s in sidx.unique():
                 m = (sidx == s)
-                preds[m] = _forward_backbone_head(shared, heads[s.item()], x[m])
+                preds[m] = heads[s.item()](z[m])      # 只跑各站独立预测头
             loss = criterion(preds, y)
             optimizer.zero_grad()
             loss.backward()

@@ -272,20 +272,28 @@ def build_station_dataframe(
     timezone_offset: int = 0,
     price_normalization: bool = False,
     add_load_norm: bool = False,
+    train_ratio: float = 0.7,
+    use_lag_features: bool = True,
+    use_rolling_features: bool = True,
+    use_static_features: bool = True,
 ) -> pd.DataFrame:
     """
     为单个站点构建包含所有特征的 DataFrame:
       - target: 充电负荷 (volume)
       - 气象特征: temp, humidity, windspeed, ...   (按时间戳合并)
       - 价格特征: e_price, s_price                 (按时间戳合并)
-      - 时间特征: hour, dayofweek, month, is_weekend (时区感知)
-      - 负荷归一化: target_per_charger, load_rate
-      - 电价标准化: e_price_zscore, e_price_rel_daily
+      - 时间特征: 循环编码 (数据已是本地时间, 不再做时区偏移)
+      - 负荷归一化: target_per_charger
+      - 电价标准化: e_price_zscore, e_price_rel_daily, e_price_quantile
 
     Args:
-        timezone_offset: 时区偏移小时数 (UTC+offset), 0=不调整
+        timezone_offset: 已废弃 (CHARGED 时间戳已是各城市本地时间), 保留仅为向后兼容
         price_normalization: 是否添加城市内标准化电价特征
-        add_load_norm: 是否添加每桩/负载率特征
+        add_load_norm: 是否添加每桩特征
+        train_ratio: 训练期占比; 电价标准化/分位数统计量仅用此前缀拟合 (防测试集泄漏)
+        use_lag_features: 是否添加滞后特征
+        use_rolling_features: 是否添加滚动统计特征
+        use_static_features: 是否添加站点静态特征
     """
     volume = city_data["volume"]
     weather = city_data["weather"]
@@ -296,11 +304,9 @@ def build_station_dataframe(
     timestamps = _parse_timestamps(volume[time_col], "volume")
     n_original = len(timestamps)
 
-    # 时区调整
-    if timezone_offset != 0:
-        local_ts = timestamps + pd.Timedelta(hours=timezone_offset)
-    else:
-        local_ts = timestamps
+    # 时间戳已是各城市本地时间 (CHARGED 官方约定), 不再做时区偏移;
+    # timezone_offset 参数保留仅为向后兼容, 现已忽略。
+    local_ts = timestamps
 
     df = pd.DataFrame()
     df["timestamp"] = timestamps
@@ -358,28 +364,37 @@ def build_station_dataframe(
             print(f"    WARNING: s_price merge changed row count "
                   f"{n_original} -> {len(df)} for station {station_id}")
 
-    # ── 3.5 电价标准化 (城市内, 消除币种差异) ──
+    # ── 3.5 电价标准化 (城市内, 消除币种差异; 统计量仅用 train 前缀拟合, 防泄漏) ──
     if price_normalization:
+        n_train = max(int(len(df) * train_ratio), 1)
+        train_slice = df.iloc[:n_train]
+
         if "e_price" in df.columns:
+            e_train = train_slice["e_price"].values
             e_vals = df["e_price"].values
-            e_mean = np.nanmean(e_vals)
-            e_std = np.nanstd(e_vals) + 1e-8
+            e_mean = np.nanmean(e_train)
+            e_std = np.nanstd(e_train) + 1e-8
             df["e_price_zscore"] = ((e_vals - e_mean) / e_std).astype(np.float32)
-            # 相对当日平均电价
-            df["e_price_daily_avg"] = (
-                df.groupby(local_ts.dt.date)["e_price"].transform("mean")
-            ).astype(np.float32)
+            # 相对近期平均电价 (因果滚动 24h 均值, 避免同日未来信息泄漏)
             df["e_price_rel_daily"] = (
-                df["e_price"] / (df["e_price_daily_avg"] + 1e-8)
+                df["e_price"]
+                / (df["e_price"].rolling(24, min_periods=1).mean() + 1e-8)
             ).astype(np.float32)
-            df.drop(columns=["e_price_daily_avg"], inplace=True)
-            # 电价分位数 (城市内, 0-1)
-            e_rank = pd.Series(e_vals).rank(pct=True).values
-            df["e_price_quantile"] = e_rank.astype(np.float32)
+            # 电价分位数: 用 train 分布的经验 CDF 映射到 [0,1]
+            e_sorted = np.sort(e_train[~np.isnan(e_train)])
+            e_quantile = np.full_like(e_vals, np.nan, dtype=np.float64)
+            valid = ~np.isnan(e_vals)
+            if e_sorted.size and valid.any():
+                e_quantile[valid] = (
+                    np.searchsorted(e_sorted, e_vals[valid], side="right")
+                    / e_sorted.size
+                )
+            df["e_price_quantile"] = e_quantile.astype(np.float32)
         if "s_price" in df.columns:
+            s_train = train_slice["s_price"].values
             s_vals = df["s_price"].values
-            s_mean = np.nanmean(s_vals)
-            s_std = np.nanstd(s_vals) + 1e-8
+            s_mean = np.nanmean(s_train)
+            s_std = np.nanstd(s_train) + 1e-8
             df["s_price_zscore"] = ((s_vals - s_mean) / s_std).astype(np.float32)
 
     # ── 4. 时间特征 (循环编码, 使用时区感知的本地时间) ──
@@ -400,37 +415,35 @@ def build_station_dataframe(
     df.drop(columns=["hour", "dayofweek", "month"], inplace=True)
 
     # ── 5. 滞后特征 (充电负荷历史值) ──
-    lag_hours = [24, 48, 168]  # 1天, 2天, 7天
-    for lag in lag_hours:
-        df[f"target_lag_{lag}h"] = df["target"].shift(lag).astype(np.float32)
+    if use_lag_features:
+        lag_hours = [24, 48, 168]  # 1天, 2天, 7天
+        for lag in lag_hours:
+            df[f"target_lag_{lag}h"] = df["target"].shift(lag).astype(np.float32)
 
     # ── 6. 滚动统计特征 ──
-    for window in [24, 168]:
-        roll = df["target"].rolling(window=window, min_periods=1)
-        df[f"target_roll_mean_{window}h"] = roll.mean().astype(np.float32)
-        df[f"target_roll_std_{window}h"] = roll.std().astype(np.float32)
-        df[f"target_roll_max_{window}h"] = roll.max().astype(np.float32)
+    if use_rolling_features:
+        for window in [24, 168]:
+            roll = df["target"].rolling(window=window, min_periods=1)
+            df[f"target_roll_mean_{window}h"] = roll.mean().astype(np.float32)
+            df[f"target_roll_std_{window}h"] = roll.std().astype(np.float32)
+            df[f"target_roll_max_{window}h"] = roll.max().astype(np.float32)
 
     # ── 7. 静态特征 (站点属性, 广播到所有时间步) ──
+    # 注: 原含 avg_power, 但它是 sites.csv 的全时段充电统计量 (测试集泄漏), 已移除。
     static = get_station_static_features(city_data, station_id)
-    for key in ["charger_num", "avg_power", "perimeter"]:
-        val = static.get(key, 0)
-        df[key] = np.float32(val)
+    if use_static_features:
+        for key in ["charger_num", "perimeter"]:
+            val = static.get(key, 0)
+            df[key] = np.float32(val)
 
     # ── 7.5 负荷归一化: 区分 "站点规模大" vs "行为模式不同" ──
+    # 注: 原 load_rate = target / (avg_power * charger_num) 依赖全时段 avg_power, 已删除。
     if add_load_norm:
         charger_num = float(static.get("charger_num", 0))
-        avg_power = float(static.get("avg_power", 0))
         if charger_num > 0:
             df["target_per_charger"] = (df["target"] / charger_num).astype(np.float32)
         else:
             df["target_per_charger"] = df["target"].copy()
-        # 负载率: target / (avg_power * charger_num) — 相对于站点容量的利用率
-        total_capacity = avg_power * charger_num
-        if total_capacity > 0:
-            df["load_rate"] = (df["target"] / total_capacity).astype(np.float32)
-        else:
-            df["load_rate"] = np.float32(0.0)
 
     # ── 8. 缺失值标记 + 前向填充 ──
     for col in df.columns:

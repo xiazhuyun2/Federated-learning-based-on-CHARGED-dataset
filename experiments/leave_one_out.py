@@ -41,7 +41,8 @@ from src.models.tcn_lstm import build_model
 from src.utils.metrics import evaluate_model, set_seed
 
 ALL_CITIES = ["SZH", "AMS", "JHB", "LOA", "MEL", "SPO"]
-TIMEZONE_OFFSETS = {"SZH": 8, "AMS": 2, "JHB": 2, "LOA": -7, "MEL": 10, "SPO": -3}
+# 时间戳已是本地时间, 不再做时区偏移 (与 config.py 一致; 保留仅为兼容旧调用)
+TIMEZONE_OFFSETS = {"SZH": 0, "AMS": 0, "JHB": 0, "LOA": 0, "MEL": 0, "SPO": 0}
 
 
 def _infer_input_dim(state_dict: dict) -> int:
@@ -80,10 +81,16 @@ def _model_cfg():
     })()
 
 
-def _prepare_station_tasks(test_city: str, top_k: int) -> list:
+def _prepare_station_tasks(test_city: str, top_k: int, reference_scaler=None) -> list:
     """构建留出城市每个站点的数据集任务 (只做一次, 供各评估函数复用).
 
-    返回 [{sid, train_ds, val_ds, test_ds, scaler, input_dim, seq_len, pred_len}]
+    Args:
+        reference_scaler: 若非 None (来自训练 5 城的共享 scaler), 用它缩放留出城市数据
+            (strict zero-shot 口径, 不接触留出城市统计); 否则用留出城市自身 scaler
+            (calibrated 口径), 并额外构建 recent_ds (train+val, 到 85% 为止) 供 few-shot
+            使用「紧邻测试期」的数据。
+
+    返回 [{sid, train_ds, val_ds, test_ds, recent_ds, scaler, input_dim, seq_len, pred_len}]
     """
     test_data = load_city_data(DATA_DIR, test_city, use_remove_zero=True)
     stations = select_top_stations(
@@ -99,7 +106,20 @@ def _prepare_station_tasks(test_city: str, top_k: int) -> list:
                 price_normalization=True,
                 add_load_norm=True,
             )
-            train_ds, val_ds, test_ds, scaler = prepare_station_data(df)
+            if reference_scaler is not None:
+                # strict zero-shot: 用 5 城共享 scaler, 不构建 recent_ds
+                train_ds, val_ds, test_ds, scaler = prepare_station_data(
+                    df,
+                    external_target_scaler=reference_scaler.target_scaler,
+                    external_feature_scaler=reference_scaler.feature_scaler)
+                recent_ds = None
+            else:
+                train_ds, val_ds, test_ds, scaler = prepare_station_data(df)
+                # recent_ds: train+val 窗口 (到 85%), 紧邻测试期, 供 few-shot/from-scratch
+                recent_ds, _, _, _ = prepare_station_data(
+                    df, train_ratio=0.85, val_ratio=0.0,
+                    external_target_scaler=scaler.target_scaler,
+                    external_feature_scaler=scaler.feature_scaler)
             if len(train_ds) == 0 or len(test_ds) == 0:
                 continue
             x0, y0 = train_ds[0]
@@ -108,6 +128,7 @@ def _prepare_station_tasks(test_city: str, top_k: int) -> list:
                 "train_ds": train_ds,
                 "val_ds": val_ds,
                 "test_ds": test_ds,
+                "recent_ds": recent_ds,
                 "scaler": scaler,
                 "input_dim": x0.shape[1],
                 "seq_len": x0.shape[0],
@@ -117,6 +138,46 @@ def _prepare_station_tasks(test_city: str, top_k: int) -> list:
             print(f"    Station {sid} failed: {e}")
             continue
     return tasks
+
+
+def _fit_reference_scaler(train_cities: list, top_k: int):
+    """在训练城市所有站点的 train 前缀上拟合一个共享 scaler (strict zero-shot 用)。
+
+    不接触留出城市任何数据, 因此是严格零样本口径下的目标/特征标准化。
+    """
+    from src.data.feature_engineering import TimeSeriesScaler
+
+    ref = TimeSeriesScaler()
+    all_target, all_feat = [], []
+    for city in train_cities:
+        cd = load_city_data(DATA_DIR, city, use_remove_zero=True)
+        stations = select_top_stations(
+            cd["volume"], "Unnamed: 0", top_k, train_ratio=0.85)
+        for sid in stations:
+            try:
+                df = build_station_dataframe(
+                    cd, sid, price_normalization=True, add_load_norm=True)
+                target = df["target"].values
+                feat_cols = [c for c in df.columns
+                             if c not in ("timestamp", "target")]
+                feat = df[feat_cols].values
+                n_train = max(int(len(target) * 0.7), 1)
+                all_target.append(target[:n_train])
+                all_feat.append(feat[:n_train])
+            except Exception:
+                continue
+
+    if not all_target:
+        return None
+    try:
+        tgt = np.concatenate(all_target).astype(np.float32)
+        fea = np.concatenate(all_feat).astype(np.float32)
+        ref.target_scaler.fit(tgt.reshape(-1, 1))
+        ref.feature_scaler.fit(fea)
+    except Exception as e:
+        print(f"    [reference scaler] 拟合失败 (特征维度可能不一致): {e}")
+        return None
+    return ref
 
 
 def _n_windows_from_days(days: int, seq_len: int, pred_len: int, n_train: int) -> int:
@@ -270,7 +331,7 @@ def evaluate_few_shot(model_path: str, tasks: list, device: str, seed: int,
                       finetune_days: int, finetune_epochs: int,
                       finetune_lr: float = 1e-4, freeze_bn: bool = False,
                       head_only: bool = False, adaptive_epochs: bool = True) -> dict:
-    """Few-shot: 用留出城市前 N 天数据微调全局模型后评估."""
+    """Few-shot: 用留出城市「紧邻测试期」的 N 天数据微调全局模型后评估."""
     print(f"\n  Few-shot ({finetune_days}d) evaluation...")
     set_seed(seed)
 
@@ -281,8 +342,9 @@ def evaluate_few_shot(model_path: str, tasks: list, device: str, seed: int,
 
     all_metrics = []
     for t in tasks:
+        finetune_ds = t.get("recent_ds") or t["train_ds"]
         n_win = _n_windows_from_days(
-            finetune_days, t["seq_len"], t["pred_len"], len(t["train_ds"]))
+            finetune_days, t["seq_len"], t["pred_len"], len(finetune_ds))
         if n_win <= 0:
             print(f"    Station {t['sid']}: {finetune_days}d < "
                   f"{t['seq_len'] + t['pred_len']}h window, insufficient, skipped")
@@ -296,7 +358,7 @@ def evaluate_few_shot(model_path: str, tasks: list, device: str, seed: int,
         model = build_model(input_dim, pred_len, _model_cfg())
         model.load_state_dict(state_dict, strict=False)
         model.to(device)
-        _train_on_windows(model, t["train_ds"], n_win, epochs,
+        _train_on_windows(model, finetune_ds, n_win, epochs,
                           finetune_lr, device, freeze_bn=freeze_bn,
                           head_only=head_only)
         loader = DataLoader(t["test_ds"], batch_size=64, shuffle=False)
@@ -311,14 +373,15 @@ def evaluate_few_shot(model_path: str, tasks: list, device: str, seed: int,
 def evaluate_from_scratch(tasks: list, device: str, seed: int,
                           finetune_days: int, scratch_epochs: int,
                           scratch_lr: float = 1e-3) -> dict:
-    """From-scratch: 用与 few-shot 完全相同的前 N 天数据从头训练 (量化预训练价值)."""
+    """From-scratch: 用与 few-shot 完全相同的「紧邻测试期」N 天数据从头训练 (量化预训练价值)."""
     print(f"\n  From-scratch ({finetune_days}d) evaluation...")
     set_seed(seed)
 
     all_metrics = []
     for t in tasks:
+        finetune_ds = t.get("recent_ds") or t["train_ds"]
         n_win = _n_windows_from_days(
-            finetune_days, t["seq_len"], t["pred_len"], len(t["train_ds"]))
+            finetune_days, t["seq_len"], t["pred_len"], len(finetune_ds))
         if n_win <= 0:
             print(f"    Station {t['sid']}: {finetune_days}d < "
                   f"{t['seq_len'] + t['pred_len']}h window, insufficient, skipped")
@@ -326,7 +389,7 @@ def evaluate_from_scratch(tasks: list, device: str, seed: int,
 
         model = build_model(t["input_dim"], t["pred_len"], _model_cfg())
         model.to(device)
-        _train_on_windows(model, t["train_ds"], n_win, scratch_epochs,
+        _train_on_windows(model, finetune_ds, n_win, scratch_epochs,
                           scratch_lr, device)
         loader = DataLoader(t["test_ds"], batch_size=64, shuffle=False)
         m = evaluate_model(model, loader, t["scaler"], device)
@@ -409,8 +472,13 @@ def _fmt_mean_std(ms):
 
 
 def run_once(args, cities, finetune_days, seed, device, base_dir, timestamp):
-    """跑单个 seed 的完整留一城市流程, 返回 {left_out: {zero_shot, few_shot,
-    from_scratch, full_local}}."""
+    """跑单个 seed 的完整留一城市流程, 返回 {left_out: {zero_shot, zero_shot_calibrated,
+    few_shot, from_scratch, full_local}}.
+
+    zero_shot 为 strict 口径 (scaler 来自训练 5 城, 不接触留出城市统计);
+    zero_shot_calibrated 为 calibrated 口径 (scaler 来自留出城市自身前 70%),
+    仅作参照。few-shot/from-scratch/full_local 均用 calibrated 任务 (含紧邻测试期的 recent_ds)。
+    """
     all_results = {}
     for left_out in cities:
         print(f"\n{'='*70}")
@@ -431,14 +499,22 @@ def run_once(args, cities, finetune_days, seed, device, base_dir, timestamp):
                 train_cities, args.top_k, args.rounds,
                 args.local_epochs, seed, model_dir)
 
-        tasks = _prepare_station_tasks(left_out, args.top_k)
+        # 两套任务: strict (参考 scaler) 与 calibrated (留出城市自身 scaler + recent_ds)
+        reference_scaler = _fit_reference_scaler(train_cities, args.top_k)
+        tasks_cal = _prepare_station_tasks(left_out, args.top_k)
+        tasks_strict = (_prepare_station_tasks(
+            left_out, args.top_k, reference_scaler=reference_scaler)
+            if reference_scaler is not None else None)
 
-        zero_shot = evaluate_zero_shot(model_path, tasks, device)
+        zero_shot = (evaluate_zero_shot(model_path, tasks_strict, device)
+                     if tasks_strict
+                     else {"RMSE": float("inf"), "WAPE": float("inf")})
+        zero_shot_calibrated = evaluate_zero_shot(model_path, tasks_cal, device)
 
         few_shot = {}
         for day in finetune_days:
             few_shot[str(day)] = evaluate_few_shot(
-                model_path, tasks, device, seed,
+                model_path, tasks_cal, device, seed,
                 finetune_days=day, finetune_epochs=args.finetune_epochs,
                 finetune_lr=args.finetune_lr, freeze_bn=args.freeze_bn,
                 head_only=args.head_only, adaptive_epochs=args.adaptive_epochs)
@@ -446,24 +522,26 @@ def run_once(args, cities, finetune_days, seed, device, base_dir, timestamp):
         from_scratch = {}
         for day in finetune_days:
             from_scratch[str(day)] = evaluate_from_scratch(
-                tasks, device, seed,
+                tasks_cal, device, seed,
                 finetune_days=day, scratch_epochs=args.scratch_epochs,
                 scratch_lr=args.scratch_lr)
 
         if args.skip_full_local:
             full_local = {"RMSE": float("inf"), "WAPE": float("inf")}
         else:
-            full_local = evaluate_full_local(tasks, args.epochs, device, seed)
+            full_local = evaluate_full_local(tasks_cal, args.epochs, device, seed)
 
         all_results[left_out] = {
             "zero_shot": zero_shot,
+            "zero_shot_calibrated": zero_shot_calibrated,
             "few_shot": few_shot,
             "from_scratch": from_scratch,
             "full_local": full_local,
         }
 
         print(f"\n  Results for {left_out}:")
-        print(f"    Zero-shot:  WAPE={zero_shot.get('WAPE', float('nan')):.1f}%")
+        print(f"    Zero-shot (strict):     WAPE={zero_shot.get('WAPE', float('nan')):.1f}%")
+        print(f"    Zero-shot (calibrated): WAPE={zero_shot_calibrated.get('WAPE', float('nan')):.1f}%")
         for day in finetune_days:
             fs = few_shot[str(day)].get("WAPE", float("inf"))
             sc = from_scratch[str(day)].get("WAPE", float("inf"))
@@ -482,17 +560,19 @@ def _print_summary(seed_results, cities, finetune_days, skip_full_local):
           f"{'s' if n_seeds > 1 else ''}, mean±std)")
     print(f"{'='*100}")
 
-    header = f"  {'City':<6s} {'ZS':>14s} "
+    header = f"  {'City':<6s} {'ZS(str)':>14s} {'ZS(cal)':>14s} "
     for day in finetune_days:
         header += f"{'FS' + str(day) + 'd':>14s} {'SC' + str(day) + 'd':>14s} "
     if not skip_full_local:
         header += f"{'FullLocal':>14s}"
     print(header)
-    print("  " + "-" * 96)
+    print("  " + "-" * 110)
 
     for city in cities:
         zs = _mean_std(_city_wape_across_seeds(seed_results, city, "zero_shot"))
-        line = f"  {city:<6s} {_fmt_mean_std(zs)} "
+        zsc = _mean_std(_city_wape_across_seeds(
+            seed_results, city, "zero_shot_calibrated"))
+        line = f"  {city:<6s} {_fmt_mean_std(zs)} {_fmt_mean_std(zsc)} "
         for day in finetune_days:
             fs = _mean_std(_city_wape_across_seeds(
                 seed_results, city, "few_shot", str(day)))
@@ -511,7 +591,12 @@ def _print_summary(seed_results, cities, finetune_days, skip_full_local):
         seed_results, c, "zero_shot"))["mean"] for c in cities]
     zero_vals = [v for v in zero_vals if not np.isnan(v)]
     if zero_vals:
-        print(f"    Zero-shot 平均 WAPE: {np.mean(zero_vals):.1f}%")
+        print(f"    Zero-shot (strict) 平均 WAPE: {np.mean(zero_vals):.1f}%")
+    zero_cal_vals = [_mean_std(_city_wape_across_seeds(
+        seed_results, c, "zero_shot_calibrated"))["mean"] for c in cities]
+    zero_cal_vals = [v for v in zero_cal_vals if not np.isnan(v)]
+    if zero_cal_vals:
+        print(f"    Zero-shot (calibrated) 平均 WAPE: {np.mean(zero_cal_vals):.1f}%")
     for day in finetune_days:
         fs_m = [_mean_std(_city_wape_across_seeds(
             seed_results, c, "few_shot", str(day)))["mean"] for c in cities]
@@ -620,6 +705,8 @@ def main():
         agg["cities"][city] = {
             "zero_shot": _mean_std(_city_wape_across_seeds(
                 seed_results, city, "zero_shot")),
+            "zero_shot_calibrated": _mean_std(_city_wape_across_seeds(
+                seed_results, city, "zero_shot_calibrated")),
             "few_shot": {str(d): _mean_std(_city_wape_across_seeds(
                 seed_results, city, "few_shot", str(d))) for d in finetune_days},
             "from_scratch": {str(d): _mean_std(_city_wape_across_seeds(

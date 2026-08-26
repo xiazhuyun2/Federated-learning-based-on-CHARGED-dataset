@@ -26,6 +26,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ALL_CITIES = ["SZH", "AMS", "JHB", "LOA", "MEL", "SPO"]
 BASELINE_DIRS = {"local_only", "centralized", "centralized_shared",
                  "centralized_personalized", "seasonal_naive"}
+# 单城市基线: 每城独立训练, 需跨城宏平均 (macro-city) 才能与多城市 FL 口径一致。
+SINGLE_CITY_BASELINES = {"local_only", "centralized_shared", "seasonal_naive"}
+# 顶层非实验目录 (不包含 method/seed_/run_ 结构), 遍历时跳过
+SKIP_TOP_DIRS = {"summaries", "leave_one_out"}
 METRIC_KEYS = ["RMSE", "MAE", "WAPE", "SMAPE", "MAPE", "NRMSE"]
 
 
@@ -45,8 +49,13 @@ def classify_run(cfg, method_dir, city=None):
     在单城市运行下仍写默认 6 城, 无法从 config 得知真实城市)。
     """
     if method_dir in BASELINE_DIRS:
-        # 基线脚本不写 config.json, 直接用目录名
-        return (method_dir, False, "AVERAGE")
+        if method_dir == "centralized_personalized":
+            # 多城市集中式个性化: 分层平衡 9 站/城, 宏站==宏城, 用 macro_city 与 FL 口径一致
+            return (method_dir, True, "macro_city")
+        # 单城市基线 (local_only / centralized_shared / seasonal_naive):
+        # 必须按城市分桶, 否则 6 城挤进同一 seed 桶, pick_best 只留最新一城 (SPO),
+        # 得到的是 SPO-only 数字 (seasonal_naive 的 std=0 即由此而来)。
+        return (f"{method_dir}__{city}", False, "AVERAGE")
 
     if cfg is None:
         return None
@@ -110,8 +119,12 @@ def collect_runs(base_dir):
     organized = defaultdict(lambda: defaultdict(list))
 
     for city in sorted(os.listdir(base_dir)):
+        if city in SKIP_TOP_DIRS:
+            continue
         city_dir = os.path.join(base_dir, city)
-        if not os.path.isdir(city_dir) or city not in ALL_CITIES:
+        # 单城市实验的城市目录在 ALL_CITIES 内; 多城市基线 (centralized_personalized)
+        # 用 "+".join(cities) 作目录名 (如 "SZH+AMS+..."), 不在 ALL_CITIES, 但也需收集。
+        if not os.path.isdir(city_dir):
             continue
         for method_dir in sorted(os.listdir(city_dir)):
             md = os.path.join(city_dir, method_dir)
@@ -205,12 +218,48 @@ def summarize(organized):
         for seed, v in per_seed.items():
             entry["seeds"][seed] = {
                 "RMSE": v["metrics"].get("RMSE"),
+                "MAE": v["metrics"].get("MAE"),
+                "WAPE": v["metrics"].get("WAPE"),
+                "worst_city_WAPE": v.get("worst_city_WAPE"),
                 "rounds": v["rounds"],
             }
             entry["src"] = v["src"]
             entry["rounds"] = v["rounds"]
         result[name] = entry
     return result
+
+
+def aggregate_single_city_baselines(result):
+    """把单城市基线 (local_only/centralized_shared/seasonal_naive) 的
+    每城 3-seed 均值跨城宏平均, 得到与多城市 FL 口径一致的 macro-city 数字。
+
+    每城详情保留在 `{method}__{city}` 条目里; 汇总写回 `{method}` 条目。
+    std 为跨城 (6 城) 标准差, 表征城市间离散度 (与 3-seed 标准差含义不同)。
+    """
+    for method in SINGLE_CITY_BASELINES:
+        city_means = {}
+        for city in ALL_CITIES:
+            e = result.get(f"{method}__{city}")
+            if not e or "WAPE" not in e:
+                continue
+            city_means[city] = {k: e[k]["mean"] for k in METRIC_KEYS if k in e}
+        if not city_means:
+            continue
+        n_cities = len(city_means)
+        entry = {"n_seeds": n_cities, "src": "macro_city",
+                 "aggregation": "macro-city over single-city baselines"}
+        for metric in METRIC_KEYS:
+            vals = [m[metric] for m in city_means.values() if metric in m]
+            if vals:
+                mean = sum(vals) / len(vals)
+                std = (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5
+                entry[metric] = {"mean": mean, "std": std, "n": len(vals)}
+        worst_city = max(city_means.items(), key=lambda kv: kv[1]["WAPE"])
+        entry["worst_city_WAPE"] = {"mean": worst_city[1]["WAPE"],
+                                    "std": 0.0, "n": 1,
+                                    "city": worst_city[0]}
+        entry["per_city_WAPE"] = {c: m["WAPE"] for c, m in city_means.items()}
+        result[method] = entry
 
 
 def print_table(result):
@@ -222,6 +271,8 @@ def print_table(result):
     print(header)
     print("  " + "-" * 88)
     for name, e in sorted(result.items()):
+        if "__" in name:  # 单城市基线每城详情 (local_only__SZH 等), 已在汇总行体现, 不重复打印
+            continue
         def fmt(k):
             if k in e:
                 return f"{e[k]['mean']:>8.2f}±{e[k]['std']:<5.2f}"
@@ -249,6 +300,7 @@ def main():
 
     organized = collect_runs(base_dir)
     result = summarize(organized)
+    aggregate_single_city_baselines(result)
 
     if not args.json_only:
         print_table(result)

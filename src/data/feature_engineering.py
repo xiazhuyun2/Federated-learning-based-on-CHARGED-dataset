@@ -169,6 +169,7 @@ def prepare_station_data(
     df, seq_len: int = 168, pred_len: int = 24,
     train_ratio: float = 0.7, val_ratio: float = 0.15,
     external_target_scaler=None,
+    external_feature_scaler=None,
 ) -> Tuple[ChargingDataset, ChargingDataset, ChargingDataset, TimeSeriesScaler]:
     """
     将站点 DataFrame 切分为 train/val/test 数据集
@@ -236,12 +237,15 @@ def prepare_station_data(
     train_target_raw = np.concatenate(train_target_raw_list)
     train_feat_raw = np.concatenate(train_feat_raw_list)
 
-    # 拟合 scaler — 如果提供了外部 target_scaler 则直接使用
+    # 拟合 scaler — 如果提供了外部 scaler (如 strict zero-shot 的 5 城共享 scaler) 则直接使用
     if external_target_scaler is not None:
         scaler.target_scaler = external_target_scaler
     else:
         scaler.target_scaler.fit(train_target_raw.reshape(-1, 1))
-    scaler.feature_scaler.fit(train_feat_raw)
+    if external_feature_scaler is not None:
+        scaler.feature_scaler = external_feature_scaler
+    else:
+        scaler.feature_scaler.fit(train_feat_raw)
 
     # 标准化全部数据
     target_scaled = scaler.target_scaler.transform(

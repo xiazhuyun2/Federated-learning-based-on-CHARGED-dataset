@@ -37,3 +37,9 @@ Thumbs.db
 
 # Paper PDFs (reference papers, exclude from git)
 paper/*.pdf
+outputs_buggy_backup/
+问题与解决*.txt
+消融实验注意事项.txt
+实验结果与问题总结.md
+实施方案(细化版).md
+github地址.txt

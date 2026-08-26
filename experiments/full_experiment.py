@@ -51,10 +51,8 @@ import sys
 import os
 import json
 import argparse
-import numpy as np
-import glob as glob_mod
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -74,93 +72,16 @@ def run_cmd(name: str, cmd: str) -> int:
     return ret
 
 
-def find_latest_metrics(base_dir: str, city: str, method: str,
-                          seeds: List[int]) -> List[Dict]:
-    """查找方法在所有种子下的 AVERAGE/metrics 值"""
-    all_avgs = []
-    for seed in seeds:
-        seed_dir = os.path.join(base_dir, city, method, f"seed_{seed}")
-        if not os.path.isdir(seed_dir):
-            continue
-        run_dirs = sorted([
-            d for d in os.listdir(seed_dir)
-            if d.startswith("run_") and os.path.isdir(os.path.join(seed_dir, d))
-        ])
-        if not run_dirs:
-            continue
-        metrics_file = os.path.join(seed_dir, run_dirs[-1], "metrics.json")
-        if os.path.isfile(metrics_file):
-            with open(metrics_file) as f:
-                data = json.load(f)
-            avg = data.get("AVERAGE", {})
-            if avg:
-                all_avgs.append(avg)
-    return all_avgs
+def collect_organized_results(base_dir: str) -> Dict:
+    """收集全部实验结果, 复用 organize_results 的逻辑。
 
-
-def find_latest_multi_city_metrics(base_dir: str, method: str,
-                                     seeds: List[int]) -> Dict:
-    """查找多城市方法的 AVERAGE, macro_city, per_city 指标"""
-    all_avg = []
-    all_macro = []
-    all_per = defaultdict(list)
-
-    for seed in seeds:
-        # 多城市输出目录命名: 使用 "MULTI" 或首个城市
-        seed_dir = os.path.join(base_dir, "MULTI", method, f"seed_{seed}")
-        if not os.path.isdir(seed_dir):
-            seed_dir = os.path.join(base_dir, "multi_city", method, f"seed_{seed}")
-        if not os.path.isdir(seed_dir):
-            continue
-        run_dirs = sorted([
-            d for d in os.listdir(seed_dir)
-            if d.startswith("run_") and os.path.isdir(os.path.join(seed_dir, d))
-        ])
-        if not run_dirs:
-            continue
-        metrics_file = os.path.join(seed_dir, run_dirs[-1], "metrics.json")
-        if not os.path.isfile(metrics_file):
-            continue
-        with open(metrics_file) as f:
-            data = json.load(f)
-        avg = data.get("AVERAGE", {})
-        macro = data.get("macro_city", {})
-        per_city = data.get("per_city", {})
-        if avg:
-            all_avg.append(avg)
-        if macro:
-            all_macro.append(macro)
-        for c, m in per_city.items():
-            if isinstance(m, dict) and "RMSE" in m:
-                all_per[c].append(m)
-
-    result = {}
-    if all_avg:
-        result["AVERAGE"] = _summarize(all_avg)
-    if all_macro:
-        result["macro_city"] = _summarize(all_macro)
-    for c, metrics_list in all_per.items():
-        result[f"per_city/{c}"] = _summarize(metrics_list)
-    return result
-
-
-def _summarize(metrics_list: List[Dict]) -> Dict:
-    """计算 mean ± std"""
-    if not metrics_list:
-        return {}
-    result = {}
-    for key in metrics_list[0]:
-        vals = [m[key] for m in metrics_list if key in m and m[key] is not None]
-        if vals:
-            result[key] = {
-                "mean": float(np.mean(vals)),
-                "std": float(np.std(vals)),
-                "n": len(vals),
-            }
-    return result
-
-
-from collections import defaultdict
+    organize_results 读取每个 run 的 config.json 重新归类为逻辑实验名 (含 α、
+    FedBN/LocalHead、station_selection、单/多城市标记), 并按「轮次优先 + 时间戳」
+    挑最优 run; 这消除了旧 find_latest_* 依赖目录名拼接 (MULTI/multi_city 前缀、
+    run_dirs[-1] 最新覆盖) 带来的错位。
+    """
+    from experiments.organize_results import collect_runs, summarize
+    return summarize(collect_runs(base_dir))
 
 
 def print_summary_table(results: Dict, title: str = "EXPERIMENT SUMMARY"):
@@ -372,11 +293,8 @@ def main():
                 seed_cmd = cmd + f" --seed {seed}"
                 run_cmd(f"{method} (seed={seed})", seed_cmd)
 
-        # 收集结果
-        for method in experiments:
-            metrics_list = find_latest_metrics(base_dir, city, method, seeds)
-            if metrics_list:
-                all_results[method] = _summarize(metrics_list)
+        # 收集结果 (按 config.json 重新归类 + 轮次优先, 而非目录名拼接)
+        all_results = collect_organized_results(base_dir)
 
         print_summary_table(all_results, f"Single-City Results — {city}")
 
@@ -409,11 +327,8 @@ def main():
                 seed_cmd = cmd + f" --seed {seed}"
                 run_cmd(f"{method} (seed={seed})", seed_cmd)
 
-        # 收集多城市指标
-        for method in experiments:
-            mcm = find_latest_multi_city_metrics(base_dir, method, seeds)
-            if mcm:
-                all_results[method] = mcm
+        # 收集多城市指标 (按 config.json 重新归类 + 轮次优先)
+        all_results = collect_organized_results(base_dir)
 
         print_summary_table(all_results, f"Multi-City Results — {cities_str}")
 
@@ -448,10 +363,7 @@ def main():
                 seed_cmd = cmd + f" --seed {seed}"
                 run_cmd(f"{method} (seed={seed})", seed_cmd)
 
-        for method in experiments:
-            metrics_list = find_latest_metrics(base_dir, city, method, seeds)
-            if metrics_list:
-                all_results[method] = _summarize(metrics_list)
+        all_results = collect_organized_results(base_dir)
 
         print_summary_table(all_results, f"Ablation 2a — Single-City: {city}")
 
@@ -481,10 +393,7 @@ def main():
                 seed_cmd = cmd + f" --seed {seed}"
                 run_cmd(f"{method} (seed={seed})", seed_cmd)
 
-        for method in multi_experiments:
-            mcm = find_latest_multi_city_metrics(base_dir, method, seeds)
-            if mcm:
-                multi_results[method] = mcm
+        multi_results = collect_organized_results(base_dir)
 
         print_summary_table(multi_results,
                            f"Ablation 2b — Multi-City: {cities_str}")
