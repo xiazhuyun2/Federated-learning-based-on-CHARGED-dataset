@@ -115,7 +115,9 @@ def _prepare_station_tasks(test_city: str, top_k: int, reference_scaler=None) ->
                 recent_ds = None
             else:
                 train_ds, val_ds, test_ds, scaler = prepare_station_data(df)
-                # recent_ds: train+val 窗口 (到 85%), 紧邻测试期, 供 few-shot/from-scratch
+                # recent_ds: train+val 窗口 (到 85%), 紧邻测试期, 供 few-shot/from-scratch。
+                # scaler 沿用 70% train 前缀拟合值 (calibrated 口径: 允许用留出城统计量),
+                # 与 test_ds 同一尺度, 保证训练/测试内部一致, 无信息泄漏。
                 recent_ds, _, _, _ = prepare_station_data(
                     df, train_ratio=0.85, val_ratio=0.0,
                     external_target_scaler=scaler.target_scaler,
@@ -271,12 +273,16 @@ def _train_on_windows(model, train_ds, n_windows: int, epochs: int, lr: float,
 
 
 def train_global_model(train_cities: list, top_k: int, rounds: int,
-                         local_epochs: int, seed: int, output_dir: str) -> str:
+                         local_epochs: int, seed: int, output_dir: str,
+                         reference_scaler=None) -> str:
     """在给定城市集上训练全局FL模型, 返回 best_model 路径.
 
     冷启动需要一个「可迁移」的单一全局模型, 因此这里**不开 FedBN / LocalHead**
     (否则 BN running stats 与预测头只存在于各站点本地、不会进入全局模型,
     zero-shot 加载到的将是一个随机 BN/头的坏模型)。
+
+    reference_scaler: 严格零样本口径下, 训练各站也用这同一个 5 城混合 scaler
+    (而非每站独立拟合), 保证 strict zero-shot 评测的输入尺度与训练一致。
     """
     print(f"\n  Training global model on {train_cities}...")
 
@@ -294,6 +300,8 @@ def train_global_model(train_cities: list, top_k: int, rounds: int,
 
     trainer = FederatedTrainer(cfg, run_dir=output_dir, city="MULTI",
                                method="leave_one_out")
+    if reference_scaler is not None:
+        trainer.reference_scaler = reference_scaler
     trainer.prepare_multi_city_clients(train_cities)
     trainer.run_federated_training()
 
@@ -400,14 +408,28 @@ def evaluate_from_scratch(tasks: list, device: str, seed: int,
     return _aggregate_metrics(all_metrics)
 
 
-def evaluate_full_local(tasks: list, epochs: int, device: str, seed: int) -> dict:
-    """Full local: 留出城市全量本地训练 (oracle 参考)."""
+def evaluate_full_local(tasks: list, epochs: int, device: str, seed: int,
+                        patience: int = 10) -> dict:
+    """Full local: 留出城市全量本地训练 (oracle 参考).
+
+    用全部测试前数据 (recent_ds = train+val 窗口, 到 85%) 训练, 并留出其中尾部
+    15% 作早停验证 (patience 轮), 与 few-shot 的「紧邻测试期」窗口对齐; 修正此前
+    只训 70% 与论文「85%」口径不符的问题。
+    """
     print(f"\n  Full local training ({len(tasks)} stations)...")
     set_seed(seed)
 
     all_metrics = []
     for t in tasks:
-        train_loader = DataLoader(t["train_ds"], batch_size=64, shuffle=True)
+        ds = t.get("recent_ds") or t["train_ds"]
+        n = len(ds)
+        n_val = max(1, int(n * 0.15))
+        n_train = n - n_val
+        train_loader = DataLoader(Subset(ds, list(range(n_train))),
+                                  batch_size=64, shuffle=True)
+        val_loader = (DataLoader(Subset(ds, list(range(n_train, n))),
+                                 batch_size=64, shuffle=False)
+                      if n_train > 0 else None)
         test_loader = DataLoader(t["test_ds"], batch_size=64, shuffle=False)
 
         model = build_model(t["input_dim"], t["pred_len"], _model_cfg())
@@ -416,8 +438,11 @@ def evaluate_full_local(tasks: list, epochs: int, device: str, seed: int) -> dic
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         criterion = nn.MSELoss()
 
-        model.train()
+        best_val = float("inf")
+        best_state = None
+        best_epoch = 0
         for epoch in range(epochs):
+            model.train()
             epoch_loss = 0.0
             for x, y in train_loader:
                 x, y = x.to(device), y.to(device)
@@ -427,9 +452,30 @@ def evaluate_full_local(tasks: list, epochs: int, device: str, seed: int) -> dic
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 optimizer.step()
                 epoch_loss += loss.item()
+
+            # 早停: 用 recent_ds 尾部验证集 (与测试同 scaler, 无测试泄漏)
+            if val_loader is not None:
+                model.eval()
+                val_loss = 0.0
+                with torch.no_grad():
+                    for x, y in val_loader:
+                        x, y = x.to(device), y.to(device)
+                        val_loss += criterion(model(x), y).item()
+                val_loss /= max(1, len(val_loader))
+                if val_loss < best_val:
+                    best_val = val_loss
+                    best_epoch = epoch
+                    best_state = {k: v.detach().clone()
+                                  for k, v in model.state_dict().items()}
+                elif epoch - best_epoch >= patience:
+                    break
+
             if (epoch + 1) % max(1, epochs // 5) == 0:
                 print(f"    Epoch {epoch+1}/{epochs}, "
-                      f"loss={epoch_loss/len(train_loader):.4f}")
+                      f"loss={epoch_loss/max(1, len(train_loader)):.4f}")
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
 
         model.eval()
         all_metrics.append(evaluate_model(model, test_loader, t["scaler"], device))
@@ -488,6 +534,10 @@ def run_once(args, cities, finetune_days, seed, device, base_dir, timestamp):
 
         train_cities = [c for c in cities if c != left_out]
 
+        # 严格零样本参考 scaler: 训练 + strict zero-shot 共用 (5 城 train 前缀拟合,
+        # 不接触留出城市任何统计量)。
+        reference_scaler = _fit_reference_scaler(train_cities, args.top_k)
+
         # 每个 seed 独立训练全局模型 (目录按 seed 区分, 避免互相覆盖)
         model_dir = os.path.join(base_dir, f"train_{left_out}_s{seed}")
         os.makedirs(model_dir, exist_ok=True)
@@ -497,10 +547,10 @@ def run_once(args, cities, finetune_days, seed, device, base_dir, timestamp):
         else:
             model_path = train_global_model(
                 train_cities, args.top_k, args.rounds,
-                args.local_epochs, seed, model_dir)
+                args.local_epochs, seed, model_dir,
+                reference_scaler=reference_scaler)
 
         # 两套任务: strict (参考 scaler) 与 calibrated (留出城市自身 scaler + recent_ds)
-        reference_scaler = _fit_reference_scaler(train_cities, args.top_k)
         tasks_cal = _prepare_station_tasks(left_out, args.top_k)
         tasks_strict = (_prepare_station_tasks(
             left_out, args.top_k, reference_scaler=reference_scaler)

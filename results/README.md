@@ -3,7 +3,7 @@
 本目录存放项目最终实验结果（已从 `outputs/` 中抽取，原始模型权重/预测图等大文件不纳入 git）。
 
 > ✅ 数字为「修复 P0 数据缺陷 + 全量重跑」后的**可信结果**，由 `experiments/organize_results.py`（场景 A/B/基线）与 `experiments/leave_one_out.py --seeds 42,123,999`（场景 C）聚合，主指标为 **Macro-City WAPE**（每城等权）。
-> 可复现 commit：`13dafe3`（核心训练代码与运行时 `79c6be4` 逐字节一致；依赖已锁定 `requirements.txt`；FL 站点 ID 见 `outputs/station_lists/*.json`）。
+> 可复现 commit：待回填（P0 修复 + 全量重跑后的新提交；依赖已锁定 `requirements.txt`；FL 站点 ID 见 `outputs/station_lists/*.json`）。上一轮可复现引用 `13dafe3` 已被 P0 缺陷污染，不再作为本目录数字的可复现基线。
 
 ## 文件说明
 
@@ -18,12 +18,12 @@
 
 | 方法 | Macro-City WAPE | 最差城市 WAPE |
 |---|---|---|
-| Base (FedAvg) | 34.07±2.01 | 56.33±5.65 |
-| **LocalHead** | **32.87±1.33** | **50.07±1.51** |
-| FedBN | 37.10±2.28 | 60.18±5.87 |
-| FedBN + LocalHead | 36.22±1.70 | 55.40±2.91 |
+| **Base (FedAvg)** | **33.68±1.56** | 55.65±4.70 |
+| LocalHead | 34.37±2.10 | **55.20±5.57** |
+| FedBN | 36.90±2.18 | 60.51±6.89 |
+| FedBN + LocalHead | 35.89±2.31 | 56.53±5.44 |
 
-结论：本地预测头（LocalHead）最优，Macro-City 均值小幅改善（34.07→32.87，1.2 点，仍小于跨种子 std 2.01），但**最差城市 WAPE 明显改善**（56.33→50.07，6.3 点）；FedBN 在本实验协议与模型下未获益（37.10 > 34.07）。
+结论：在这套协议与模型下，两种轻量个性化机制都**没有带来显著增益**——纯分层 FedAvg（Base）反而最优（33.68）。LocalHead（34.37）与 Base 几乎打平（平均差 0.7 点、最差城市改善 0.45 点，均在跨种子 std 内）；FedBN 明显变差（36.90，约 +3.2 点）。
 
 ### 场景 B · 比例分配（城市权重指数 α）
 
@@ -39,13 +39,13 @@
 
 | 方法 | 平均 WAPE |
 |---|---|
-| strict zero-shot（严格零样本，scaler 不校准） | 426.5（被 SPO 1916.7 / JHB 322.1 的尺度失配主导） |
-| calibrated zero-shot（校准零样本） | 44.97 |
-| few-shot (14d / 30d) | 36.91 / **34.52** |
+| strict zero-shot（严格零样本，scaler 不校准） | 273.6（被 SPO / JHB 的尺度失配主导） |
+| calibrated zero-shot（校准零样本） | 49.15 |
+| few-shot (14d / 30d) | 39.97 / **38.32** |
 | from-scratch (14d / 30d) | 41.81 / 38.87 |
-| full-data local baseline | 46.04 |
+| full-data local baseline | 39.31 |
 
-结论：**few-shot（30 天）最优（34.52），优于 full-data local baseline（46.04）与校准零样本（44.97）**；from-scratch 30 天（38.87）也反超 full-local。strict zero-shot（426.5）揭示 scaler 不迁移（SPO/JHB 尺度失配），故必须与 calibrated zero-shot 分列报告。预训练平均有益但存在明显负迁移（few-shot 在 4/6 城市劣于校准零样本）。
+结论：**冷启动的头号杀手是「尺度不对齐」而非「模型参数迁移」**——strict zero-shot（273.6，被 SPO 1246/JHB 139.9 主导）与 calibrated zero-shot（49.15）用的是同一预训练主干、同样零训练，只差 scaler 来源就差了 224 点，证明预训练主干可跨城复用、卡点在数据归一化。在此之上 30 天 few-shot 再降约 11 点（49.15→38.32），但迁移的边际价值随本地数据量递减：few-shot 对 from-scratch 只差 0.55 点，且逐城看，JHB/LOA/MEL/SPO 四个小城迁移正向（5–10 点）、SZH/AMS 两个数据富集城反而受损（SZH 差 22 点）。
 
 ### 基线（Macro-City WAPE %）
 

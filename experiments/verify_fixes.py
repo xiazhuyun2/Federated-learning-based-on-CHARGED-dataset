@@ -123,7 +123,7 @@ def check_best_model_saved_correctly():
     for p in best_model.parameters():
         p.data.fill_(1.0)
     trainer.best_model_state = copy.deepcopy(best_model.state_dict())
-    trainer.best_val_rmse = 0.5
+    trainer.best_val_metric = 0.5
 
     # clients[0].model: 全 2.0 (若保存逻辑回退到 clients[0].model, 会存成 2.0)
     client0_model = Tiny()

@@ -139,10 +139,16 @@ class FederatedTrainer:
         self._use_fedbn = config.model.use_fedbn
         self._use_local_head = config.model.use_local_head
 
-        # 最佳模型追踪
-        self.best_val_rmse = float("inf")
+        # 参考 scaler (严格零样本冷启动): 非 None 时所有站点数据用这同一个
+        # 5 城混合 scaler 缩放, 与 strict zero-shot 评测口径一致 (而非每站独立拟合)。
+        self.reference_scaler = None
+
+        # 最佳模型追踪 (选轮指标: 多城市 = macro_city_WAPE, 单城市 = WAPE, 越小越优)
+        self.best_val_metric = float("inf")
         self.best_round = 0
         self.best_model_state = None
+        # FedBN/LocalHead: 最佳轮每个客户端本地 BN/头 的快照 (选轮时与 global 同时捕获)
+        self.best_local_states = None
 
         # 聚合验收 (问题与解决3.txt 第三节三层证据)
         self._city_weights = None
@@ -167,12 +173,18 @@ class FederatedTrainer:
               f"{len(df.columns)-2} features, "
               f"mean load={df['target'].mean():.2f}")
 
+        ext_tgt = (self.reference_scaler.target_scaler
+                   if self.reference_scaler else None)
+        ext_feat = (self.reference_scaler.feature_scaler
+                    if self.reference_scaler else None)
         train_ds, val_ds, test_ds, scaler = prepare_station_data(
             df,
             seq_len=self.cfg.data.seq_len,
             pred_len=self.cfg.data.pred_len,
             train_ratio=self.cfg.data.train_ratio,
             val_ratio=self.cfg.data.val_ratio,
+            external_target_scaler=ext_tgt,
+            external_feature_scaler=ext_feat,
         )
 
         if len(train_ds) == 0:
@@ -279,11 +291,15 @@ class FederatedTrainer:
                 train_ratio=train_ratio)
         return stations
 
-    def _station_list_path(self) -> str:
+    def _station_list_path(self, cities: List[str]) -> str:
         d = self.cfg.data
+        # 城市集合必须进缓存键: 留一城市等场景下, 不同 fold 用不同城市子集,
+        # 若只用选站策略/seed 作键, 首个 fold 生成的站点列表会被后续 fold 复用,
+        # 导致部分城市站点为空 (P0: 5/6 个 fold 实际只训 4 城)。
+        city_key = "_".join(sorted(cities))
         sig = (f"{d.station_selection}_k{d.top_k_stations}_"
                f"tr{d.train_ratio}_vr{d.val_ratio}_rz{int(d.use_remove_zero)}"
-               f"_s{self.cfg.seed}")
+               f"_s{self.cfg.seed}_c{city_key}")
         return os.path.join(OUTPUT_DIR, "station_lists", f"{sig}.json")
 
     def _load_or_create_station_list(self, cities: List[str]) -> Dict[str, List[str]]:
@@ -293,7 +309,7 @@ class FederatedTrainer:
         保证同一选站策略+seed 下, α/FedBN/LocalHead 等所有实验使用完全相同的站点
         (问题与解决3.txt 第二节第 127 行要求)。
         """
-        path = self._station_list_path()
+        path = self._station_list_path(cities)
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 station_list = json.load(f)
@@ -369,6 +385,21 @@ class FederatedTrainer:
 
         # 统一选站 (场景A分层 / 场景B比例分配), 并持久化保证跨实验一致
         station_list = self._load_or_create_station_list(cities)
+
+        # P0 防御 (缓存键已含城市集合, 此处兜底): 任何城市站点为空 = 静默漏城,
+        # 直接失败而非静默继续 (留一城市场景曾因此 5/6 fold 只训 4 城)。
+        expected = self.cfg.data.top_k_stations
+        for c in cities:
+            got = station_list.get(c)
+            if not got:
+                raise RuntimeError(
+                    f"城市 {c} 站点列表为空: 缓存 {self._station_list_path(cities)} "
+                    f"可能由旧版不含城市集合的键生成, 请删除 outputs/station_lists/ 重跑")
+            if (self.cfg.data.station_selection != "proportional"
+                    and len(got) != expected):
+                # 分层抽样在有效站点不足 k 时会返回全部 (合法), 故仅告警非空即继续。
+                print(f"  WARNING: 城市 {c} 站点数 {len(got)} != 期望 {expected} "
+                      f"(该城有效站点可能不足, 非空即继续)")
 
         for city in cities:
             print(f"\n  --- City: {city} ---")
@@ -561,11 +592,27 @@ class FederatedTrainer:
                       f"MAE: {val_metrics['MAE']:.4f} | "
                       f"WAPE: {val_metrics.get('WAPE', 0):.2f}%")
 
-                # 追踪最佳模型
-                if val_metrics["RMSE"] < self.best_val_rmse:
-                    self.best_val_rmse = val_metrics["RMSE"]
+                # 追踪最佳模型: 主指标选轮 (多城市 = macro_city_WAPE, 单城市 = WAPE)
+                best_metric = (
+                    val_metrics.get("macro_city_WAPE",
+                                    val_metrics.get("WAPE", float("inf")))
+                    if len(self.cities) > 1
+                    else val_metrics.get("WAPE", float("inf")))
+                if best_metric < self.best_val_metric:
+                    self.best_val_metric = best_metric
                     self.best_round = round_idx + 1
                     self.best_model_state = copy.deepcopy(server.get_global_params())
+                    # FedBN/LocalHead: 同时快照每个客户端本地 BN/头, 否则评测时
+                    # 会形成「最佳轮主干 + 末轮本地头」的混合。
+                    if self.excluded_param_names:
+                        self.best_local_states = {
+                            client.client_id: {
+                                k: v.detach().clone()
+                                for k, v in client.model.state_dict().items()
+                                if k in self.excluded_param_names
+                            }
+                            for client in self.clients
+                        }
             else:
                 print(f"  Round {round_idx+1:3d}/{self.cfg.fed.num_rounds} | "
                       f"Loss: {avg_loss:.4f}")
@@ -599,12 +646,22 @@ class FederatedTrainer:
         print(f"  Final Test Evaluation (best model from round {self.best_round})")
         print(f"{'='*60}")
 
-        # 恢复最佳模型
+        # 恢复最佳模型 (global 主干 + 每个客户端本地 BN/头, 保证评测用最佳轮而非末轮)
         if self.best_model_state is not None:
             if isinstance(server, ClusteredFLServer):
                 server.global_model.load_state_dict(self.best_model_state)
             else:
                 server.global_model.load_state_dict(self.best_model_state)
+
+        if self.best_local_states:
+            for client in self.clients:
+                local = self.best_local_states.get(client.client_id)
+                if not local:
+                    continue
+                sd = client.model.state_dict()
+                for k, v in local.items():
+                    if k in sd:
+                        sd[k].copy_(v)
 
         test_results, predictions = self._test_all_clients_with_preds(server)
 
@@ -846,6 +903,10 @@ class FederatedTrainer:
         self.tracker.save_config(self.cfg)
 
         # 保存训练历史
+        history["best_round"] = self.best_round
+        history["best_val_metric"] = self.best_val_metric
+        history["best_metric_name"] = (
+            "macro_city_WAPE" if len(self.cities) > 1 else "WAPE")
         with open(os.path.join(self.run_dir, "history.json"), "w") as f:
             json.dump(history, f, indent=2, default=str)
 
@@ -877,7 +938,7 @@ class FederatedTrainer:
         if self.best_model_state is not None:
             best_model = copy.deepcopy(self.clients[0].model)
             best_model.load_state_dict(self.best_model_state)
-            self.tracker.save_best_model(best_model, self.best_val_rmse)
+            self.tracker.save_best_model(best_model, self.best_val_metric)
 
         # FedBN/LocalHead: 同时保存所有客户端的本地 BN/头 (个性化参数),
         # 否则只存 client[0] 会丢失其余站点的预测头。
@@ -887,6 +948,10 @@ class FederatedTrainer:
                 for client in self.clients
             }
             torch.save(local_models, os.path.join(self.run_dir, "local_models.pt"))
+            # 最佳轮本地 BN/头 (与 best_model.pt 同轮, 用于可复现评测)
+            if self.best_local_states:
+                torch.save(self.best_local_states,
+                           os.path.join(self.run_dir, "best_local_models.pt"))
 
         # 保存预测值
         if predictions:

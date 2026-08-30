@@ -81,12 +81,12 @@ class ExperimentTracker:
             json.dump(test_results, f, indent=2, default=str)
         return path
 
-    def save_best_model(self, model: torch.nn.Module, val_rmse: float):
-        """保存验证集最优模型 checkpoint"""
+    def save_best_model(self, model: torch.nn.Module, val_metric: float):
+        """保存验证集最优模型 checkpoint (val_metric 为选轮指标, 越小越优)"""
         path = os.path.join(self.run_dir, "best_model.pt")
         torch.save({
             "model_state_dict": model.state_dict(),
-            "val_rmse": val_rmse,
+            "val_metric": val_metric,
             "run_id": self.run_id,
         }, path)
         return path
