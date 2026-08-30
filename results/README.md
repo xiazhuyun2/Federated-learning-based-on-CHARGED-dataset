@@ -3,7 +3,7 @@
 本目录存放项目最终实验结果（已从 `outputs/` 中抽取，原始模型权重/预测图等大文件不纳入 git）。
 
 > ✅ 数字为「修复 P0 数据缺陷 + 全量重跑」后的**可信结果**，由 `experiments/organize_results.py`（场景 A/B/基线）与 `experiments/leave_one_out.py --seeds 42,123,999`（场景 C）聚合，主指标为 **Macro-City WAPE**（每城等权）。
-> 可复现 commit：待回填（P0 修复 + 全量重跑后的新提交；依赖已锁定 `requirements.txt`；FL 站点 ID 见 `outputs/station_lists/*.json`）。上一轮可复现引用 `13dafe3` 已被 P0 缺陷污染，不再作为本目录数字的可复现基线。
+> 可复现 commit：`ab40131`（P0 修复 + 全量重跑后的新提交；依赖已锁定 `requirements.txt`；FL 站点 ID 见 `outputs/station_lists/*.json`）。上一轮可复现引用 `13dafe3` 已被 P0 缺陷污染，不再作为本目录数字的可复现基线。
 
 ## 文件说明
 
